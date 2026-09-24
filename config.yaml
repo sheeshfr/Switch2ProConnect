@@ -13,31 +13,7 @@ cemuhook_pad_overwrite_idx: 0
 change_profile_mode: Manual
 controller_calibration_aliases: {}
 controller_fast_cache: true
-controller_fast_cache_entries:
-  98:E2:55:FF:FE:40:
-    controller_info_hex: 0100484557313030303038383530313900007e056920010601232323a0a0a0e6e6e6323232ffffffffffffffffffffffffffffffffffffffffffffffffffffff
-    product_id: 8297
-    schema: 1
-    stick_primary:
-      center:
-      - 1925
-      - 2260
-      max:
-      - 1593
-      - 1572
-      min:
-      - 1586
-      - 1512
-    stick_secondary:
-      center:
-      - 2089
-      - 2152
-      max:
-      - 1599
-      - 1646
-      min:
-      - 1563
-      - 1575
+controller_fast_cache_entries: {}
 driver_installed: false
 driver_type: WinUHid
 esp32_serial_device_id: ''

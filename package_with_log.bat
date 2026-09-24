@@ -4,7 +4,7 @@ if "%PYTHON_COMMAND%"=="" (
     if exist ".venv\Scripts\python.exe" (
         set "PYTHON_COMMAND=.venv\Scripts\python.exe"
     ) else (
-        set "PYTHON_COMMAND=py -3.11"
+        set "PYTHON_COMMAND=python"
     )
 )
 
@@ -15,10 +15,9 @@ REM  The shipping build is packaged with --noconsole, which leaves sys.stderr as
 REM  None. The logging StreamHandler in src/controller.py writes to stderr, so a
 REM  --noconsole exe produces NO log at all -- there is nothing to ask a reporter
 REM  to send. This build uses --console so the full log is visible and can be
-REM  redirected to a file. Its runtime hook also enables the opt-in System
-REM  Bluetooth Joy-Con diagnostic timeline before the application starts.
+REM  redirected to a file.
 REM
-REM  Output: dist\Switch2Connect_<version>_log.exe (does not overwrite the normal build).
+REM  Output: dist\Switch2ProConnect_<version>_log.exe (does not overwrite the normal build).
 REM ============================================================================
 
 REM Read the version straight out of src\gui.py so the exe name can never drift from
@@ -97,7 +96,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-%PYTHON_COMMAND% -m PyInstaller --console --onefile --clean --runtime-hook "tools/enable_system_bt_diagnostics.py" --paths src --add-binary "drivers/WinUHid.dll;drivers" --add-binary "drivers/WinUHidDevs.dll;drivers" --add-data "resources;resources" --add-data "%PACKAGE_CONFIG_FILE%;resources" --add-data "%PACKAGE_CONFIG_DIR%\mag_tester_enabled.marker;." --add-data "drivers/install_driver.ps1;drivers" --add-data "drivers/install.bat;drivers" --add-data "drivers/uninstall_driver.ps1;drivers" --add-data "drivers/uninstall.bat;drivers" --add-data "drivers/uninstall_vigembus.ps1;drivers" --add-data "drivers/uninstall_vigembus.bat;drivers" --add-data "drivers/USBip-0.9.7.7-x64.exe;drivers" --add-data "drivers/install_usbip.ps1;drivers" --add-data "drivers/uninstall_usbip.ps1;drivers" --add-data "drivers/WinUHidDriver.inf;drivers" --add-data "drivers/WinUHidDriver.dll;drivers" --add-data "drivers/winuhiddriver.cat;drivers" --add-data "drivers/WinUHidDriver.cer;drivers" --add-data "drivers/esp32s3;drivers/esp32s3" --add-data "drivers/hidhide;drivers/hidhide" --add-data "firmware_bin;firmware_bin" --add-data "src;src" --collect-all vgamepad --collect-all imufusion --collect-all bleak --collect-all winrt --collect-all hid --collect-all libusb_package --hidden-import gui_listeners --hidden-import gui_wizards --hidden-import gui_player_block --hidden-import gui_widgets --hidden-import gui_drivers_mixin --hidden-import gui_settings_mixin --hidden-import imufusion --hidden-import hid --hidden-import usb.core --hidden-import usb.util --hidden-import libusb_package --hidden-import driver_install_helper --hidden-import usb_hid_controller --hidden-import hidhide --hidden-import usbip_server --name "Switch2ProConnect_%APP_VERSION%_log" --icon="resources/images/icon.ico" src/gui.py
+%PYTHON_COMMAND% -m PyInstaller -y --console --onefile --clean --paths src --add-binary "drivers/WinUHid.dll;drivers" --add-binary "drivers/WinUHidDevs.dll;drivers" --add-data "resources;resources" --add-data "%PACKAGE_CONFIG_FILE%;resources" --add-data "%PACKAGE_CONFIG_DIR%\mag_tester_enabled.marker;." --add-data "drivers/install_driver.ps1;drivers" --add-data "drivers/install.bat;drivers" --add-data "drivers/uninstall_driver.ps1;drivers" --add-data "drivers/uninstall.bat;drivers" --add-data "drivers/WinUHidDriver.inf;drivers" --add-data "drivers/WinUHidDriver.dll;drivers" --add-data "drivers/winuhiddriver.cat;drivers" --add-data "drivers/WinUHidDriver.cer;drivers" --add-data "drivers/hidhide;drivers/hidhide" --add-data "src;src" --collect-all vgamepad --collect-all imufusion --collect-all bleak --collect-all winrt --collect-all hid --collect-all libusb_package --hidden-import gui_listeners --hidden-import gui_wizards --hidden-import gui_player_block --hidden-import gui_widgets --hidden-import gui_drivers_mixin --hidden-import gui_settings_mixin --hidden-import imufusion --hidden-import hid --hidden-import usb.core --hidden-import usb.util --hidden-import libusb_package --hidden-import driver_install_helper --hidden-import usb_hid_controller --hidden-import hidhide --hidden-import usbip_server --name "Switch2ProConnect_%APP_VERSION%_log" --icon="resources/images/icon.ico" src/gui.py
 set "BUILD_EXIT=%ERRORLEVEL%"
 
 rmdir /S /Q "%PACKAGE_CONFIG_DIR%" >nul 2>nul
@@ -105,13 +104,12 @@ rmdir /S /Q "%PACKAGE_CONFIG_DIR%" >nul 2>nul
 if "%BUILD_EXIT%"=="0" (
     echo.
     echo ==========================================================================
-    echo  Built: dist\Switch2Connect_%APP_VERSION%_log.exe
-    echo  System Bluetooth Joy-Con diagnostics: enabled automatically
+    echo  Built: dist\Switch2ProConnect_%APP_VERSION%_log.exe
     echo.
     echo  To save the log to a file, run it from a terminal rather than
     echo  double-clicking it:
     echo.
-    echo      dist\Switch2Connect_%APP_VERSION%_log.exe ^> wired-test.log 2^>^&1
+    echo      dist\Switch2ProConnect_%APP_VERSION%_log.exe ^> app.log 2^>^&1
     echo.
     echo  WARNING: do not select text in the console window while testing.
     echo  Windows QuickEdit freezes every thread that writes a log record, which
