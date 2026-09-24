@@ -1,0 +1,5284 @@
+# Switch2Connect - A Python and ESP32-S3 bridge utility for Switch 2 controller inputs.
+# Copyright (C) 2026 TommyWabg
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# Contact Information:
+# Electronic Mail: tommyw9318@gmail.com
+
+import struct
+import winuhid_client as winuhid
+from vigem_commons import DS4_REPORT_EX, DS4_BUTTONS, DS4_DPAD_DIRECTIONS, DS4_SPECIAL_BUTTONS
+import threading
+import os
+import math
+from collections import deque
+
+VIRTUAL_DEVICE_CREATION_LOCK = threading.Lock()
+import time
+
+_vigem_import_lock = threading.Lock()
+_vigem_module = None
+
+def get_vigem():
+    global _vigem_module
+    with _vigem_import_lock:
+        if _vigem_module is not None:
+            return _vigem_module
+        import sys
+        for mod in list(sys.modules.keys()):
+            if mod == 'vgamepad' or mod.startswith('vgamepad.'):
+                sys.modules.pop(mod, None)
+        import vgamepad as vigem
+        _vigem_module = vigem
+        return _vigem_module
+import asyncio
+import threading
+import ctypes
+import logging
+import gc
+import timer_resolution
+import power_saving
+from controller import (Controller, ControllerInputData, VibrationData,
+                        NSO_GAMECUBE_CONTROLLER_PID,
+                        USBIP_PS5_CONCURRENT_RUMBLE_TEST,
+                        ds_motion_scale)
+from config import CONFIG, ButtonConfig, SWITCH_BUTTONS, XB_BUTTONS
+from usbip_server import USBIPServer
+from utils import USBIPAllocator, get_usbip_exe_path
+from system_bt_pair_rumble import SystemBluetoothPairRumbleCoordinator
+_PERF_DIAGNOSTICS = os.environ.get('SWITCH2_PERF_DIAGNOSTICS', '0') == '1'
+
+logger = logging.getLogger(__name__)
+
+# Xbox One impulse-trigger calibration.  The frame carries the linear base
+# amplitude; controller.py applies the shared Xbox HF dynamic mask exactly once
+# at the physical-output stage, where the target controller type is known.
+IMPULSE_RAW_MAX = 100
+IMPULSE_HF_AMP_MAX = 1023
+IMPULSE_HF_FREQ_LOW = 300
+IMPULSE_HF_FREQ_HIGH = 481
+IMPULSE_RAW_LOW = 1
+IMPULSE_RAW_HIGH = 100
+IMPULSE_RELEASE_SECONDS = 0.090
+
+
+def _impulse_release_scale(elapsed_seconds):
+    elapsed = max(0.0, float(elapsed_seconds))
+    return max(0.0, 1.0 - elapsed / IMPULSE_RELEASE_SECONDS)
+
+
+def _next_impulse_release_state(current_raw, release_started, new_raw, now,
+                                force_clear=False):
+    """Return raw, start time, changed and stopped for one independent side."""
+    current_raw = max(0, min(IMPULSE_RAW_MAX, int(current_raw)))
+    release_started = max(0.0, float(release_started))
+    new_raw = max(0, min(IMPULSE_RAW_MAX, int(new_raw)))
+    if force_clear:
+        changed = current_raw > 0 or release_started > 0.0
+        return 0, 0.0, changed, current_raw > 0
+    if new_raw > 0:
+        if current_raw == new_raw and release_started <= 0.0:
+            return current_raw, 0.0, False, False
+        return new_raw, 0.0, True, False
+    if current_raw > 0 and release_started <= 0.0:
+        return current_raw, float(now), True, True
+    return current_raw, release_started, False, False
+
+
+def _resolve_impulse_release(current_raw, release_started, now):
+    """Return raw, scale, active and expired for one side at a point in time."""
+    current_raw = max(0, min(IMPULSE_RAW_MAX, int(current_raw)))
+    release_started = max(0.0, float(release_started))
+    if current_raw <= 0:
+        return 0, 0.0, False, False
+    if release_started <= 0.0:
+        return current_raw, 1.0, True, False
+    elapsed = max(0.0, float(now) - release_started)
+    if elapsed >= IMPULSE_RELEASE_SECONDS:
+        return 0, 0.0, False, True
+    return current_raw, _impulse_release_scale(elapsed), True, False
+
+
+def _impulse_release_frequency_raw(source_raw, release_scale):
+    """Map the instantaneous release strength back into the dynamic raw domain."""
+    source_raw = max(0, min(IMPULSE_RAW_MAX, int(source_raw)))
+    scale = min(1.0, max(0.0, float(release_scale)))
+    if source_raw == 0 or scale <= 0.0:
+        return 0
+    return max(IMPULSE_RAW_LOW, min(
+        IMPULSE_RAW_MAX, int((source_raw * scale) + 0.5)))
+
+def _round_half_up_ratio(numerator, denominator):
+    return (numerator + denominator // 2) // denominator
+
+
+def _impulse_dynamic_hf_frequency(raw):
+    raw = max(IMPULSE_RAW_LOW, min(IMPULSE_RAW_HIGH, int(raw)))
+    return _round_half_up_ratio(
+        IMPULSE_HF_FREQ_LOW * (IMPULSE_RAW_HIGH - IMPULSE_RAW_LOW)
+        + (raw - IMPULSE_RAW_LOW)
+          * (IMPULSE_HF_FREQ_HIGH - IMPULSE_HF_FREQ_LOW),
+        IMPULSE_RAW_HIGH - IMPULSE_RAW_LOW)
+
+def _impulse_fixed_hf_frequency(setting):
+    """Maps the 1..10 fixed-frequency setting into the 300..481 HF range."""
+    setting = max(1, min(10, int(setting)))
+    return _round_half_up_ratio(
+        IMPULSE_HF_FREQ_LOW * 9
+        + (setting - 1) * (IMPULSE_HF_FREQ_HIGH - IMPULSE_HF_FREQ_LOW),
+        9)
+
+
+def _map_xbox_impulse_trigger(raw, dynamic_frequency=True, fixed_frequency=10,
+                              frequency_raw=None):
+    """Maps a WinUHid impulse percentage to a linear, pre-mask HF frame."""
+    raw = max(0, min(IMPULSE_RAW_MAX, int(raw)))
+    if raw == 0:
+        return _zero_vibration()
+
+    hf_amp = _round_half_up_ratio(IMPULSE_HF_AMP_MAX * raw, IMPULSE_RAW_HIGH)
+    if dynamic_frequency:
+        frequency_raw = raw if frequency_raw is None else max(
+            IMPULSE_RAW_LOW, min(IMPULSE_RAW_MAX, int(frequency_raw)))
+        hf_freq = _impulse_dynamic_hf_frequency(frequency_raw)
+    else:
+        hf_freq = _impulse_fixed_hf_frequency(fixed_frequency)
+    hf_freq = max(1, min(511, hf_freq))
+    return VibrationData(
+        lf_amp=0, hf_amp=hf_amp, hf_freq=hf_freq, impulse_raw=raw)
+
+def _copy_vibration(v) -> VibrationData:
+    return VibrationData(
+        lf_freq=v.lf_freq, lf_amp=v.lf_amp, lf_en_tone=getattr(v, 'lf_en_tone', False),
+        hf_freq=v.hf_freq, hf_amp=v.hf_amp, hf_en_tone=getattr(v, 'hf_en_tone', False),
+        impulse_raw=getattr(v, 'impulse_raw', 0),
+        impulse_scale=getattr(v, 'impulse_scale', 1.0)
+    )
+
+def _zero_vibration(lf_freq=0x0e1, hf_freq=0x1e1) -> VibrationData:
+    return VibrationData(lf_freq=lf_freq, hf_freq=hf_freq, lf_amp=0, hf_amp=0)
+
+def _clear_vibration_buffer(frames, lf_freq=0x0e1, hf_freq=0x1e1):
+    for f in frames:
+        f.lf_amp = 0
+        f.hf_amp = 0
+        f.lf_freq = lf_freq
+        f.hf_freq = hf_freq
+
+def _fuse_djg_axis(dom_adj, sub_adj, scale):
+    if (dom_adj > 0 and sub_adj > 0) or (dom_adj < 0 and sub_adj < 0):
+        sub_scaled = sub_adj * scale
+        if abs(sub_scaled) > abs(dom_adj):
+            sub_scaled = dom_adj
+        return dom_adj + sub_scaled
+    return dom_adj
+
+
+def _merge_djg_direct_motion(left_g, right_g, left_a, right_a,
+                             left_active, right_active):
+    zero = (0.0, 0.0, 0.0)
+    if left_active and right_active:
+        merged_g = tuple(left_g[i] + right_g[i] for i in range(3))
+        if left_a != zero and right_a != zero:
+            merged_a = tuple((left_a[i] + right_a[i]) * 0.5 for i in range(3))
+        else:
+            merged_a = left_a if left_a != zero else right_a
+        return merged_g, merged_a
+    if left_active:
+        return tuple(left_g), tuple(left_a)
+    if right_active:
+        return tuple(right_g), tuple(right_a)
+    return zero, zero
+
+
+def _sync_merged_in_app_gyro_state(controllers, active):
+    """Publish one authoritative In-App Gyro state to a merged Joy-Con pair.
+
+    The operation is idempotent because either controller callback may observe a
+    release first. A skipped/non-dominant side must never retain a live gyro
+    producer after the shared trigger is off.
+    """
+    active = bool(active)
+    for controller in controllers:
+        was_active = bool(getattr(controller, "gyro_mouse_enabled", False))
+        controller.gyro_mouse_enabled = active
+        if active:
+            if not was_active:
+                wake = getattr(controller, "_wake_interpolation_output", None)
+                if wake is not None:
+                    wake()
+                else:
+                    controller._interp_wake_event.set()
+            continue
+        controller.gr_was_pressed = False
+        controller.gyro_target_vx = 0.0
+        controller.gyro_target_vy = 0.0
+        controller._gyro_rstick_out = (0.0, 0.0)
+        controller.gyro_steering_origin_accel = None
+        if was_active:
+            wake = getattr(controller, "_wake_interpolation_output", None)
+            if wake is not None:
+                wake()
+            else:
+                controller._interp_wake_event.set()
+
+
+MAC_TO_USBIP = {}
+
+
+def get_ds4_dpad(up, down, left, right):
+    if up and right: return DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_NORTHEAST
+    if down and right: return DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_SOUTHEAST
+    if down and left: return DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_SOUTHWEST
+    if up and left: return DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_NORTHWEST
+    if up: return DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_NORTH
+    if down: return DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_SOUTH
+    if left: return DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_WEST
+    if right: return DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_EAST
+    return DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_NONE
+
+def float_to_byte(val):
+    return int(max(0, min(255, round(val * 127.5 + 128))))
+
+def detach_usbip_device(server_port: int, timeout=2.0):
+    import subprocess
+    import os
+    import re
+    
+    usbip_exe = get_usbip_exe_path()
+    if not os.path.exists(usbip_exe):
+        return
+        
+    bus_id = f"1-{server_port - 3240 + 1}"
+    try:
+        res = subprocess.run([usbip_exe, "port"], capture_output=True, text=True,
+                             timeout=max(0.1, float(timeout)),
+                             creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+        if res.returncode != 0:
+            return
+            
+        ports = res.stdout.split("Port ")
+        for port_block in ports[1:]:
+            lines = port_block.splitlines()
+            if not lines:
+                continue
+            first_line = lines[0]
+            port_match = re.match(r"^(\d+):", first_line)
+            if port_match:
+                port_num_str = port_match.group(1)
+                if f":{server_port}" in port_block or f"/{bus_id}" in port_block:
+                    logger.info(f"Detaching USBIP device on port {port_num_str} associated with server port {server_port} (bus_id: {bus_id})")
+                    try:
+                        subprocess.run([usbip_exe, "detach", "-p", port_num_str], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0, timeout=max(0.1, float(timeout)))
+                    except subprocess.TimeoutExpired:
+                        logger.warning(f"Timeout while detaching USBIP port {port_num_str}. Process may be hung.")
+    except Exception as e:
+        logger.error(f"Error detaching USBIP device for port {server_port}: {e}")
+
+def detach_all_usbip_devices(timeout=2.0):
+    import subprocess
+    import os
+    import re
+    
+    usbip_exe = get_usbip_exe_path()
+    if not os.path.exists(usbip_exe):
+        return
+        
+    try:
+        res = subprocess.run([usbip_exe, "port"], capture_output=True, text=True,
+                             timeout=max(0.1, float(timeout)),
+                             creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+        if res.returncode != 0:
+            return
+            
+        ports = res.stdout.split("Port ")
+        for port_block in ports[1:]:
+            lines = port_block.splitlines()
+            if not lines:
+                continue
+            first_line = lines[0]
+            port_match = re.match(r"^(\d+):", first_line)
+            if port_match:
+                port_num_str = port_match.group(1)
+                should_detach = False
+                for p in range(3240, 3248):
+                    bus_id = f"1-{p - 3240 + 1}"
+                    if f":{p}" in port_block or f"/{bus_id}" in port_block:
+                        should_detach = True
+                        break
+                if should_detach:
+                    logger.info(f"Detaching USBIP device on port {port_num_str} associated with a virtual controller slot")
+                    try:
+                        subprocess.run([usbip_exe, "detach", "-p", port_num_str], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0, timeout=max(0.1, float(timeout)))
+                    except subprocess.TimeoutExpired:
+                        logger.warning(f"Timeout while detaching USBIP port {port_num_str}. Process may be hung.")
+    except Exception as e:
+        logger.error(f"Error detaching all USBIP devices: {e}")
+
+RUMBLE_WRITE_INTERVAL = 0.0166
+SWITCH_RUMBLE_TIMEOUT = 0.150
+# A Joy-Con reports about every 11-15 ms, so a submit taking this long has already
+# cost the game a frame of input and points at the virtual pad driver blocking.
+SUBMIT_SLOW_WARN_MS = 10.0
+# Seconds between submit warnings, so a struggling session reports the problem
+# without the logging itself adding to the load.
+SUBMIT_WARN_INTERVAL = 5.0
+AUDIO_HAPTIC_HOLD_MIN_AMPLITUDE = 5
+# DualSense 0x02 output-report bytes masked out of the traditional-rumble stop
+# signature: motors [3],[4] plus valid_flag0/1 [1],[2] and valid_flag2 [39].
+_TRAD_RUMBLE_SIG_MASK_OFFSETS = (1, 2, 3, 4, 39)
+# While another rumble source is present (audio_recent), an ambiguous
+# (non-exact-match) motor=0 stop is APPLIED only after the rumble owner has
+# been silent (no non-zero motor packet) for this long.  It never clears a
+# held value by itself - it only delays an explicitly received stop packet.
+TRAD_RUMBLE_STOP_DEFER_WINDOW = 0.30
+MAC_TO_PORT = {}
+
+def get_or_assign_port_for_mac(mac):
+    global MAC_TO_PORT
+    if mac in MAC_TO_PORT:
+        return MAC_TO_PORT[mac]
+    
+    import discoverer
+    used_ports = set()
+    for vc in discoverer.VIRTUAL_CONTROLLERS:
+        if vc is not None:
+            if hasattr(vc, 'server_port'):
+                used_ports.add(vc.server_port)
+            if hasattr(vc, 'server_port_l') and vc.server_port_l:
+                used_ports.add(vc.server_port_l)
+            if hasattr(vc, 'server_port_r') and vc.server_port_r:
+                used_ports.add(vc.server_port_r)
+    
+    used_ports.update(MAC_TO_PORT.values())
+    
+    for p in range(3240, 3256):
+        if p not in used_ports:
+            MAC_TO_PORT[mac] = p
+            return p
+    return 3240
+
+
+
+
+class VirtualController:
+    def _wake_rumble_schedulers(self):
+        for controller in tuple(getattr(self, "controllers", ())):
+            controller._poke_rumble_scheduler(activate=True)
+
+    def _run_rumble_callback(self, callback, *args):
+        try:
+            if power_saving.rumble_allowed():
+                return callback(*args)
+            return None
+        finally:
+            self._wake_rumble_schedulers()
+
+    @property
+    def player_number(self):
+        return self._player_number
+
+    @player_number.setter
+    def player_number(self, val):
+        self._player_number = val
+
+    def __init__(self, player_number: int, controllers=None, on_disconnected_callback=None, setup_usb=True):
+        self._player_number = player_number
+        self.controllers = controllers or []
+        self._refresh_controller_cache()
+        
+        self.on_disconnected_callback = on_disconnected_callback
+        
+        if self.controllers:
+            mac = self.controllers[0].device.address
+            
+            global MAC_TO_USBIP
+            if mac in MAC_TO_USBIP:
+                self.host_ip, self.bus_id, self.server_port = MAC_TO_USBIP[mac]
+            else:
+                self.host_ip, self.bus_id, self.server_port = USBIPAllocator.allocate()
+                MAC_TO_USBIP[mac] = (self.host_ip, self.bus_id, self.server_port)
+        else:
+            self.host_ip, self.bus_id, self.server_port = USBIPAllocator.allocate()
+
+        self.haptic_processor = None
+                    
+        self.previous_buttons_left = 0x00000000
+        self.previous_buttons_right = 0x00000000
+        self.last_s2_lx = 0.0
+        self.last_s2_ly = 0.0
+        self.last_s2_rx = 0.0
+        self.last_s2_ry = 0.0
+        self.last_s2_gx = 0
+        self.last_s2_gy = 0
+        self.last_s2_gz = 0
+        self.last_s2_ax = 0
+        self.last_s2_ay = 0
+        self.last_s2_az = 0
+        self.next_vibration_event = None
+        self.vg_controller = None
+        self.dualsense_audio_guard = None
+        self.switch_vibrations_left = [VibrationData() for _ in range(3)]
+        self.switch_vibrations_right = [VibrationData() for _ in range(3)]
+        self.vibration_dirty_l = False
+        self.vibration_dirty_r = False
+        self.slot_inputs = [[(0x0e1, 0, 0x1e1, 0)] for _ in range(3)]
+        self.slot_inputs_right = [[(0x0e1, 0, 0x1e1, 0)] for _ in range(3)]
+        self.rumble_force_clear = False
+        
+        # Thread-safe target vibration state, change event, and task reference
+        self.vibration_lock = threading.Lock()
+        # Xbox impulse triggers are a latest-state overlay, never part of the
+        # ordinary mono rumble buffers.
+        self.xbox_impulse_raw_l = 0
+        self.xbox_impulse_raw_r = 0
+        self.xbox_impulse_release_started_l = 0.0
+        self.xbox_impulse_release_started_r = 0.0
+        self.xbox_impulse_sequence = 0
+        self.xbox_impulse_stop_sequence = 0
+        self.xbox_impulse_sequence_l = 0
+        self.xbox_impulse_sequence_r = 0
+        self.xbox_impulse_stop_sequence_l = 0
+        self.xbox_impulse_stop_sequence_r = 0
+        self._xbox_feedback_generation = 0
+        self.target_vibration_l = VibrationData(lf_amp=0, hf_amp=0)
+        self.target_vibration_r = VibrationData(lf_amp=0, hf_amp=0)
+        self.latest_vibration_l = VibrationData(lf_amp=0, hf_amp=0)
+        self.latest_vibration_r = VibrationData(lf_amp=0, hf_amp=0)
+        self.frame_vibrations_l = [VibrationData(lf_amp=0, hf_amp=0) for _ in range(3)]
+        self.frame_vibrations_r = [VibrationData(lf_amp=0, hf_amp=0) for _ in range(3)]
+        self.audio_haptic_latest_vibration_l = VibrationData(lf_amp=0, hf_amp=0)
+        self.audio_haptic_latest_vibration_r = VibrationData(lf_amp=0, hf_amp=0)
+        self.audio_haptic_frame_vibrations_l = [VibrationData(lf_amp=0, hf_amp=0) for _ in range(3)]
+        self.audio_haptic_frame_vibrations_r = [VibrationData(lf_amp=0, hf_amp=0) for _ in range(3)]
+        self.audio_haptic_vibration_dirty_l = False
+        self.audio_haptic_vibration_dirty_r = False
+        self.audio_haptic_ttl_l = 0
+        self.audio_haptic_ttl_r = 0
+        self.traditional_rumble_seq = 0
+        self.traditional_rumble_stop_seq = 0
+        self.trigger_effect_seq = 0
+        self.audio_haptic_seq = 0
+        self.latest_vibration = VibrationData(lf_amp=0, hf_amp=0)
+        self.frame_vibrations = [VibrationData(lf_amp=0, hf_amp=0) for _ in range(3)]
+        self.vibration_dirty = False
+        self.last_rumble_active_time = 0.0
+        self.traditional_rumble_active = False
+        self.traditional_rumble_zero_keepalive_seen = False
+        self.traditional_rumble_last_zero_signature = None
+        self.traditional_rumble_last_flag_masked_signature = None
+        self._trad_rumble_stop_diag_logged = False
+        self._trad_rumble_pending_stop_at = None
+        self.traditional_rumble_last_motor_r = 0
+        self.traditional_rumble_last_motor_l = 0
+        self.last_usbip_audio_packet_time = 0.0
+        self.vibration_changed_event = None
+        self.active_vibration_task = None
+        self.cycle_start_time = 0.0
+        self.loop = None
+        self.touch_tracking_id = 0
+        self.was_touching = False
+        self.was_touching_0 = False
+        self.was_touching_1 = False
+        self.touch_start_time = 0.0
+        self.hold_mode = "Vertical"
+        self.active_gyro_side = "Right"
+        
+        self.djg_last_dom_gyro_on = False
+        self.djg_last_sub_gyro_on = False
+        self.djg_accel_offset = [0.0, 0.0, 0.0]
+        self.djg_cached_gyro = {'Left': [0.0, 0.0, 0.0], 'Right': [0.0, 0.0, 0.0]}
+        self.djg_cached_accel = {'Left': [0.0, 0.0, 0.0], 'Right': [0.0, 0.0, 0.0]}
+        self.djg_direct_cached_gyro = {'Left': (0.0, 0.0, 0.0), 'Right': (0.0, 0.0, 0.0)}
+        self.djg_direct_cached_accel = {'Left': (0.0, 0.0, 0.0), 'Right': (0.0, 0.0, 0.0)}
+        self.djg_left_active = True
+        self.djg_right_active = True
+        
+        self.mode = getattr(CONFIG, "simulation_mode", "PS5")
+        self.driver_type = getattr(CONFIG, "driver_type", "WinUHid")
+        self._usbip_reconnect_lock = threading.Lock()
+        self._usbip_reconnect_active = False
+        self._usbip_reconnect_generation = 0
+        # Invalidates reports captured for a virtual device that is being replaced.
+        # The submit worker is independent from the GUI/mode-switching thread, so
+        # mode alone is not a safe discriminator while a native call is queued.
+        self._virtual_device_generation = 0
+        self._suppress_usbip_reconnect = False
+        if self.mode == "Switch1":
+            self.hold_mode = "Vertical"
+        if setup_usb:
+            self._setup_vg_controller()
+        else:
+            self.vg_controller = None
+            self.usbip_server = None
+        
+        # Driver/device lifetime lock. Never take this from a physical BLE input
+        # callback: update()/teardown calls below may block in a native driver.
+        self.state_lock = threading.RLock()
+        # Short-lived lock for state shared by the two physical Joy-Con callback
+        # threads. Keeping it separate prevents a slow virtual-pad submit from
+        # stalling notification delivery (and therefore IR Mouse input).
+        self.merged_input_lock = threading.RLock()
+        self._disconnect_lock = asyncio.Lock()
+
+        # Input submits run on a dedicated thread. The virtual-pad drivers submit
+        # input with a blocking native call, and it used to run inline on the Bleak
+        # notification callback -- i.e. on the shared DISCOVERER_LOOP. While the
+        # driver was busy delivering rumble output reports that call could block,
+        # which stalled notification delivery for every controller and left input
+        # frozen at its last value until the rumble stopped. Producers now only
+        # leave the newest frame in a slot and return.
+        self._submit_lock = threading.Lock()
+        self._submit_pending = None      # (..., buttonsConfig, virtual-device generation)
+        self._submit_sticky_buttons = 0  # presses from frames superseded before submit
+        self._submit_wake = threading.Event()
+        self._submit_stop = False
+        self._submit_thread = None
+        self._submit_fail_count = 0
+        self._last_submit_fail_warn = 0.0
+        self._last_slow_submit_warn = 0.0
+        self._submit_superseded_count = 0
+        self._submit_cooperative_yield_count = 0
+        self._input_rate_diagnostics = os.environ.get(
+            "SWITCH2_INPUT_RATE_DIAGNOSTICS", "0").lower() in (
+                "1", "true", "yes", "on")
+        self._submit_published_count = 0
+        self._submit_attempted_count = 0
+        self._submit_completed_count = 0
+        self._submit_rejected_count = 0
+        self._submit_durations_ms = deque(maxlen=2048)
+        self._submit_diag_superseded_start = 0
+        self._submit_rate_window_start = time.perf_counter()
+        self._rumble_cb_count = 0
+        self._rumble_cb_window_start = 0.0
+        self._update_wake = threading.Event()
+        self._full_submit_signatures = {}
+        self._last_submit_power_mode = None
+        
+        # Adaptive Trigger State Tracking (for Weapon mode recoil kicks)
+        self.trigger_r_prev_force = 0
+        self.trigger_l_prev_force = 0
+        
+        self.running = True
+        self.update_thread = threading.Thread(target=self._1000hz_loop, daemon=True)
+        self.update_thread.start()
+
+    def _start_dualsense_audio_guard(self):
+        pass
+
+    def _stop_dualsense_audio_guard(self):
+        pass
+
+    def _on_ps5_usbip_disconnected(self):
+        if getattr(self, 'mode', None) != "PS5" or getattr(self, 'driver_type', None) != "USBIP":
+            return
+        if getattr(self, '_suppress_usbip_reconnect', False):
+            return
+        try:
+            from discoverer import IS_SHUTTING_DOWN, _IS_SUSPENDING
+            if IS_SHUTTING_DOWN or _IS_SUSPENDING:
+                return
+        except Exception:
+            pass
+        if not getattr(self, 'running', False):
+            return
+        with self._usbip_reconnect_lock:
+            if self._usbip_reconnect_active:
+                return
+            self._usbip_reconnect_active = True
+            self._usbip_reconnect_generation += 1
+            generation = self._usbip_reconnect_generation
+        threading.Thread(
+            target=self._ps5_usbip_reconnect_worker,
+            args=(generation,),
+            name=f"PS5USBIPReconnectP{self.player_number}",
+            daemon=True,
+        ).start()
+
+    def _ps5_usbip_reconnect_worker(self, generation):
+        try:
+            import os
+            import subprocess
+
+            usbip_exe = get_usbip_exe_path()
+            if not os.path.exists(usbip_exe):
+                logger.error("Cannot reconnect PS5 USBIP: usbip.exe not found at %s", usbip_exe)
+                return
+
+            for attempt, delay in enumerate((0.5, 1.0, 2.0), start=1):
+                if not getattr(self, 'running', False):
+                    return
+                time.sleep(delay)
+                if not getattr(self, 'running', False):
+                    return
+                try:
+                    from discoverer import IS_SHUTTING_DOWN, _IS_SUSPENDING
+                    if IS_SHUTTING_DOWN or _IS_SUSPENDING:
+                        return
+                except Exception:
+                    pass
+                with self._usbip_reconnect_lock:
+                    if generation != self._usbip_reconnect_generation:
+                        return
+
+                host = self.host_ip
+                port = self.server_port
+                bus = self.bus_id
+                try:
+                    logger.info(
+                        "PS5 USBIP reconnect attempt %d for Player %s on %s:%s bus=%s",
+                        attempt,
+                        self.player_number,
+                        host,
+                        port,
+                        bus,
+                    )
+                    detach_usbip_device(port)
+                    time.sleep(0.2)
+                    proc = subprocess.run(
+                        [usbip_exe, "-t", str(port), "attach", "-r", host, "-b", bus],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=10,
+                        creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
+                    )
+                    out = proc.stdout.decode(errors='replace').strip()
+                    err = proc.stderr.decode(errors='replace').strip()
+                    if out:
+                        logger.info("Player %s usbip reconnect stdout: %s", self.player_number, out)
+                    if err:
+                        logger.warning("Player %s usbip reconnect stderr: %s", self.player_number, err)
+                    if proc.returncode == 0:
+                        logger.info("Player %s PS5 USBIP reconnect OK on %s:%s bus=%s", self.player_number, host, port, bus)
+                        return
+                    logger.error(
+                        "Player %s PS5 USBIP reconnect failed attempt %d rc=%s",
+                        self.player_number,
+                        attempt,
+                        proc.returncode,
+                    )
+                except Exception as exc:
+                    logger.warning("Player %s PS5 USBIP reconnect attempt %d error: %s", self.player_number, attempt, exc)
+        finally:
+            with self._usbip_reconnect_lock:
+                if generation == self._usbip_reconnect_generation:
+                    self._usbip_reconnect_active = False
+
+    def _controller_mix_key(self, controller):
+        try:
+            return controller.device.address
+        except Exception:
+            return str(id(controller))
+
+    def _refresh_controller_cache(self):
+        controllers = tuple(getattr(self, "controllers", ()) or ())
+        self._controllers_tuple = controllers
+        self._is_merged_pair = len(controllers) == 2
+        left = None
+        right = None
+        for c in controllers:
+            try:
+                if c.is_joycon_left():
+                    left = c
+                elif c.is_joycon_right():
+                    right = c
+            except Exception:
+                pass
+        self._merged_pair = (left, right)
+        self._controller_mix_keys = tuple(self._controller_mix_key(c) for c in controllers)
+        # A merged pair has exactly one mouse interpolation/output owner. Keep the
+        # right Joy-Con as owner so its IR Mouse and Raw Input device retain their
+        # natural sink while gyro targets from either side are mixed into it.
+        if self._is_merged_pair and left is not None and right is not None:
+            sources = (left, right)
+            for controller in sources:
+                controller._merged_mouse_sources = sources
+                controller._merged_mouse_output_owner = right
+            right._interp_wake_event.set()
+            left._interp_wake_event.set()
+        else:
+            for controller in controllers:
+                controller._merged_mouse_sources = (controller,)
+                controller._merged_mouse_output_owner = controller
+                controller._interp_wake_event.set()
+
+    def _is_system_bt_merged_joycon_pair(self):
+        """Scope guard for the System-Bluetooth merged Joy-Con workaround."""
+        controllers = getattr(self, '_controllers_tuple', ())
+        if len(controllers) != 2 or not getattr(self, '_is_merged_pair', False):
+            return False
+        left, right = getattr(self, '_merged_pair', (None, None))
+        if left is None or right is None or left is right:
+            return False
+        for controller in (left, right):
+            if getattr(controller, 'is_esp32s3_bridge', False):
+                return False
+            if getattr(controller, 'is_wired_usb', False):
+                return False
+        return True
+
+    async def _activate_system_bt_merged_pair(self):
+        if not self._is_system_bt_merged_joycon_pair():
+            return
+        left, right = self._merged_pair
+        current = getattr(self, '_system_bt_pair_controllers', None)
+        if current == (left, right):
+            return
+
+        await self._deactivate_system_bt_merged_pair()
+        session_id = f"P{self.player_number}-{time.monotonic_ns()}"
+        self._system_bt_pair_session_id = session_id
+        self._system_bt_pair_controllers = (left, right)
+
+        retained_left = False
+        retained_right = False
+        request_enabled = bool(getattr(
+            CONFIG, 'system_bt_merged_pair_throughput_request', True))
+        request_mode = str(getattr(
+            CONFIG, 'system_bt_merged_pair_request_mode', 'both')).lower()
+        if request_mode not in ('off', 'left', 'right', 'both', 'both_delayed'):
+            request_mode = 'both'
+        if not request_enabled:
+            request_mode = 'off'
+        try:
+            if request_mode in ('left', 'both'):
+                retained_left = await left._create_merged_pair_connection_parameter_request(
+                    session_id, "Left")
+            if request_mode in ('right', 'both'):
+                retained_right = await right._create_merged_pair_connection_parameter_request(
+                    session_id, "Right")
+
+            if getattr(CONFIG, 'system_bt_merged_pair_coordinator', True):
+                coordinator = SystemBluetoothPairRumbleCoordinator(
+                    self, left, right, session_id,
+                    cadence_hz=getattr(CONFIG, 'system_bt_merged_pair_cadence_hz', 66),
+                    adaptive=getattr(CONFIG, 'system_bt_merged_pair_adaptive_cadence', True),
+                    request_mode=request_mode)
+                self._system_bt_pair_rumble_coordinator = coordinator
+                coordinator.start()
+            if request_mode == 'both_delayed':
+                async def create_delayed_requests():
+                    await asyncio.sleep(2.0)
+                    if (getattr(self, '_system_bt_pair_session_id', None) != session_id or
+                            getattr(self, '_system_bt_pair_controllers', None) != (left, right)):
+                        return
+                    delayed_left = await left._create_merged_pair_connection_parameter_request(
+                        session_id, "Left")
+                    delayed_right = await right._create_merged_pair_connection_parameter_request(
+                        session_id, "Right")
+                    logger.info(
+                        "System-BT merged delayed preferred requests session=%s left=%s right=%s",
+                        session_id, "retained" if delayed_left else "not-retained",
+                        "retained" if delayed_right else "not-retained",
+                        extra={"system_bt_merged": True})
+                self._system_bt_pair_request_task = asyncio.create_task(
+                    create_delayed_requests())
+        except BaseException:
+            # Cancellation or setup failure must not strand a request belonging
+            # to a pair session that never completed activation.
+            left._close_merged_pair_connection_parameter_request()
+            right._close_merged_pair_connection_parameter_request()
+            self._system_bt_pair_controllers = None
+            self._system_bt_pair_session_id = None
+            raise
+
+        logger.info(
+            "System-BT merged Joy-Con session activated session=%s "
+            "request_mode=%s throughput_request_left=%s throughput_request_right=%s",
+            session_id,
+            request_mode,
+            "retained" if retained_left else "not-retained",
+            "retained" if retained_right else "not-retained",
+            extra={"system_bt_merged": True})
+
+    async def _deactivate_system_bt_merged_pair(self):
+        request_task = getattr(self, '_system_bt_pair_request_task', None)
+        self._system_bt_pair_request_task = None
+        if request_task is not None:
+            request_task.cancel()
+            try:
+                await request_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        coordinator = getattr(self, '_system_bt_pair_rumble_coordinator', None)
+        if coordinator is not None:
+            coordinator.stop()
+            self._system_bt_pair_rumble_coordinator = None
+
+        controllers = getattr(self, '_system_bt_pair_controllers', None) or ()
+        for controller in controllers:
+            controller._close_merged_pair_connection_parameter_request()
+        if controllers:
+            logger.info(
+                "System-BT merged Joy-Con session released session=%s",
+                getattr(self, '_system_bt_pair_session_id', 'unknown'),
+                extra={"system_bt_merged": True})
+        self._system_bt_pair_controllers = None
+        self._system_bt_pair_session_id = None
+
+    def _publish_system_bt_pair_rumble(self, controller, uuid, payload, active,
+                                       sustain=True):
+        if not self._is_system_bt_merged_joycon_pair():
+            return False
+        coordinator = getattr(self, '_system_bt_pair_rumble_coordinator', None)
+        if coordinator is None or not coordinator.owns(controller):
+            return False
+        return coordinator.submit(controller, uuid, payload, active, sustain=sustain)
+
+    def _clamp_stick_pair(self, stick):
+        return (
+            max(-1.0, min(1.0, stick[0])),
+            max(-1.0, min(1.0, stick[1])),
+        )
+
+    def _clamp_stick_magnitude(self, stick):
+        x, y = stick
+        mag = (x * x + y * y) ** 0.5
+        if mag > 1.0:
+            return x / mag, y / mag
+        return self._clamp_stick_pair((x, y))
+
+    def _is_djg_none_merge(self):
+        return bool(
+            getattr(CONFIG, "djg_enabled", False) and
+            getattr(CONFIG, "djg_mode", "Single Side Toggle") == "Single Side Toggle" and
+            getattr(CONFIG, "djg_dominant_side", "Right") == "None"
+        )
+
+    def _direct_merged_motion(self, inputData):
+        left_g = self.djg_direct_cached_gyro.get("Left", (0.0, 0.0, 0.0))
+        right_g = self.djg_direct_cached_gyro.get("Right", (0.0, 0.0, 0.0))
+        left_a = self.djg_direct_cached_accel.get("Left", (0.0, 0.0, 0.0))
+        right_a = self.djg_direct_cached_accel.get("Right", (0.0, 0.0, 0.0))
+        return _merge_djg_direct_motion(
+            left_g, right_g, left_a, right_a,
+            bool(getattr(self, 'djg_left_active', True)),
+            bool(getattr(self, 'djg_right_active', True)))
+
+    def _controller_mapping_scope(self, controller):
+        active = (
+            getattr(controller, "gyro_mouse_enabled", False) or
+            getattr(controller, "_in_app_gyro_mapping_active_this_frame", False)
+        )
+        return "in_app_gyro_mode_mappings" if active else None
+
+    def _joystick_mapping_mode(self, key, controller):
+        return CONFIG.get_mapping_setting_scoped(key, "Default", self._controller_mapping_scope(controller))
+
+    def _update_merged_stick_mix(self, inputData, controller):
+        if not hasattr(self, "_merged_stick_contribs"):
+            self._merged_stick_contribs = {}
+        route = getattr(inputData, "custom_joystick_mapping", None)
+        left = (0.0, 0.0)
+        right = (0.0, 0.0)
+        if route:
+            if route.get("target") == "left":
+                left = inputData.left_stick
+            elif route.get("target") == "right":
+                right = inputData.right_stick
+        elif controller.is_joycon_left():
+            left = inputData.left_stick
+        elif controller.is_joycon_right():
+            right = inputData.right_stick
+        else:
+            left_mode = self._joystick_mapping_mode("l_joystick", controller)
+            right_mode = self._joystick_mapping_mode("r_joystick", controller)
+            if left_mode == "R Joystick":
+                right = (right[0] + inputData.left_stick[0], right[1] + inputData.left_stick[1])
+            elif left_mode == "L Joystick" or left_mode == "Default":
+                left = (left[0] + inputData.left_stick[0], left[1] + inputData.left_stick[1])
+
+            if right_mode == "L Joystick":
+                left = (left[0] + inputData.right_stick[0], left[1] + inputData.right_stick[1])
+            elif right_mode == "R Joystick" or right_mode == "Default":
+                right = (right[0] + inputData.right_stick[0], right[1] + inputData.right_stick[1])
+
+        self._merged_stick_contribs[self._controller_mix_key(controller)] = (left, right)
+        active_keys = getattr(self, "_controller_mix_keys", None)
+        if active_keys is None:
+            self._refresh_controller_cache()
+            active_keys = self._controller_mix_keys
+        for key in list(self._merged_stick_contribs.keys()):
+            if key not in active_keys:
+                self._merged_stick_contribs.pop(key, None)
+
+        sum_left = (0.0, 0.0)
+        sum_right = (0.0, 0.0)
+        for l, r in self._merged_stick_contribs.values():
+            sum_left = (sum_left[0] + l[0], sum_left[1] + l[1])
+            sum_right = (sum_right[0] + r[0], sum_right[1] + r[1])
+        return self._clamp_stick_pair(sum_left), self._clamp_stick_pair(sum_right)
+
+    def handle_djg_trigger(self, controller, pressed=True):
+        activation = getattr(CONFIG, "djg_activation", "Toggle")
+        if activation == "Toggle" and not pressed:
+            return
+            
+        mode = getattr(CONFIG, "djg_mode", "Single Side Toggle")
+        if mode == "Single Side Toggle":
+            if controller.is_joycon_left():
+                self.djg_left_active = not self.djg_left_active
+            else:
+                self.djg_right_active = not self.djg_right_active
+        elif mode == "Switch Dominant Side":
+            current = getattr(CONFIG, "djg_dominant_side", "Right")
+            CONFIG.djg_dominant_side = "Right" if current == "Left" else "Left"
+            CONFIG.save_config()
+            self.djg_left_active = True
+            self.djg_right_active = True
+        elif mode == "Switch Gyro Side":
+            current = getattr(CONFIG, "djg_dominant_side", "Right")
+            new_side = "Right" if current == "Left" else "Left"
+            self.active_gyro_side = new_side
+            CONFIG.djg_dominant_side = new_side
+            CONFIG.save_config()
+            
+        import utils
+        if hasattr(utils, 'force_ui_update_callback') and utils.force_ui_update_callback:
+            utils.force_ui_update_callback()
+
+    def gyro_fusion_callback(self, inputData: ControllerInputData, controller):
+        # This runs inline on the physical input path and must never wait for the
+        # driver lock, which is allowed to span blocking native calls.
+        with self.merged_input_lock:
+            if getattr(controller, 'is_calibrating', False) or getattr(controller, 'is_mag_calibrating', False):
+                controller._skip_gyro_mouse = False
+                return
+
+            controllers = getattr(self, "_controllers_tuple", None)
+            if controllers is None or len(controllers) != len(self.controllers):
+                self._refresh_controller_cache()
+                controllers = self._controllers_tuple
+
+            is_merged = len(controllers) == 2
+            for c in controllers:
+                c.is_merged = is_merged
+
+            if is_merged:
+                merged_dampening_states = {}
+                for c in controllers:
+                    for key, pressed in (getattr(c, "_profile_combo_btn_states", {}) or {}).items():
+                        merged_dampening_states[key] = bool(merged_dampening_states.get(key, False) or pressed)
+                for c in controllers:
+                    c._shared_dampening_btn_states = merged_dampening_states
+            else:
+                controller._shared_dampening_btn_states = dict(getattr(controller, "_profile_combo_btn_states", {}) or {})
+
+            direct_merge = is_merged and self._is_djg_none_merge()
+            if direct_merge:
+                for c in controllers:
+                    c._skip_gyro_mouse = False
+                return
+
+            if len(self.controllers) == 2 and getattr(CONFIG, "djg_enabled", False):
+                djg_dom_side = getattr(CONFIG, "djg_dominant_side", "Right")
+                djg_sub_side = "Right" if djg_dom_side == "Left" else "Left"
+                
+                side = "Left" if controller.is_joycon_left() else "Right"
+                self.djg_cached_gyro[side] = inputData.gyroscope
+                self.djg_cached_accel[side] = inputData.accelerometer
+                
+                left_c, right_c = getattr(self, "_merged_pair", (None, None))
+                dom_c = left_c if djg_dom_side == "Left" else right_c
+                sub_c = right_c if djg_dom_side == "Left" else left_c
+                
+                dom_on = getattr(dom_c, 'gyro_active', True) if dom_c else False
+                sub_on = getattr(sub_c, 'gyro_active', True) if sub_c else False
+                
+                # When both Joy-Cons feed the gyro, gyro_fusion_callback fuses their motion
+                # into one identical gyro stream for both controllers. Each controller runs
+                # its own gyro-mouse interpolation thread, so letting both emit would double
+                # the cursor movement. The sub (non-dominant) side therefore skips its own
+                # gyro-mouse emission and only the dominant side emits the fused motion. This
+                # applies in every activation mode: the In-App Gyro trigger is now shared, so
+                # in Hold/Toggle both sides would otherwise be enabled at once (not just in
+                # Always On as before).
+                if dom_on and sub_on:
+                    if (controller.is_joycon_left() and djg_sub_side == "Left") or (controller.is_joycon_right() and djg_sub_side == "Right"):
+                        controller._skip_gyro_mouse = True
+                    else:
+                        controller._skip_gyro_mouse = False
+                else:
+                    controller._skip_gyro_mouse = False
+                
+                if self.djg_last_dom_gyro_on and not dom_on and sub_on:
+                    dom_accel = self.djg_cached_accel[djg_dom_side]
+                    sub_accel = self.djg_cached_accel[djg_sub_side]
+                    self.djg_accel_offset = [
+                        dom_accel[0] - sub_accel[0],
+                        dom_accel[1] - sub_accel[1],
+                        dom_accel[2] - sub_accel[2]
+                    ]
+                elif not self.djg_last_dom_gyro_on and dom_on and sub_on:
+                    dom_accel = self.djg_cached_accel[djg_dom_side]
+                    sub_accel = self.djg_cached_accel[djg_sub_side]
+                    self.djg_accel_offset = [
+                        (sub_accel[0] + self.djg_accel_offset[0]) - dom_accel[0],
+                        (sub_accel[1] + self.djg_accel_offset[1]) - dom_accel[1],
+                        (sub_accel[2] + self.djg_accel_offset[2]) - dom_accel[2]
+                    ]
+                
+                self.djg_last_dom_gyro_on = dom_on
+                self.djg_last_sub_gyro_on = sub_on
+                
+                dom_bias = dom_c.gyro_bias if dom_c else (0.0, 0.0, 0.0)
+                sub_bias = sub_c.gyro_bias if sub_c else (0.0, 0.0, 0.0)
+                my_bias = controller.gyro_bias
+                
+                if dom_on and sub_on:
+                    dom_g = self.djg_cached_gyro[djg_dom_side]
+                    sub_g = self.djg_cached_gyro[djg_sub_side]
+                    dom_a = self.djg_cached_accel[djg_dom_side]
+                    
+                    d0 = dom_g[0] - dom_bias[0]
+                    d1 = dom_g[1] - dom_bias[1]
+                    d2 = dom_g[2] - dom_bias[2]
+                    s0 = sub_g[0] - sub_bias[0]
+                    s1 = sub_g[1] - sub_bias[1]
+                    s2 = sub_g[2] - sub_bias[2]
+                    dom_mag = math.sqrt(d0*d0 + d1*d1 + d2*d2)
+                    
+                    scale = 0.0
+                    if dom_mag > 30.0:
+                        scale = min(1.0, (dom_mag - 30.0) / 30.0)
+
+                    fused_gyro = (
+                        _fuse_djg_axis(d0, s0, scale) + my_bias[0],
+                        _fuse_djg_axis(d1, s1, scale) + my_bias[1],
+                        _fuse_djg_axis(d2, s2, scale) + my_bias[2],
+                    )
+                    off = self.djg_accel_offset
+                    fused_accel = (dom_a[0] + off[0], dom_a[1] + off[1], dom_a[2] + off[2])
+                elif dom_on:
+                    dom_g = self.djg_cached_gyro[djg_dom_side]
+                    dom_a = self.djg_cached_accel[djg_dom_side]
+                    off = self.djg_accel_offset
+                    fused_gyro = (
+                        dom_g[0] - dom_bias[0] + my_bias[0],
+                        dom_g[1] - dom_bias[1] + my_bias[1],
+                        dom_g[2] - dom_bias[2] + my_bias[2],
+                    )
+                    fused_accel = (dom_a[0] + off[0], dom_a[1] + off[1], dom_a[2] + off[2])
+                elif sub_on:
+                    sub_g = self.djg_cached_gyro[djg_sub_side]
+                    sub_a = self.djg_cached_accel[djg_sub_side]
+                    fused_gyro = (
+                        sub_g[0] - sub_bias[0] + my_bias[0],
+                        sub_g[1] - sub_bias[1] + my_bias[1],
+                        sub_g[2] - sub_bias[2] + my_bias[2],
+                    )
+                    fused_accel = (sub_a[0], sub_a[1], sub_a[2])
+                else:
+                    fused_gyro = (my_bias[0], my_bias[1], my_bias[2])
+                    fused_accel = (0.0, 0.0, 0.0)
+
+                off0, off1, off2 = self.djg_accel_offset
+                self.djg_accel_offset = [
+                    off0 * 0.99 if abs(off0) > 0.1 else 0.0,
+                    off1 * 0.99 if abs(off1) > 0.1 else 0.0,
+                    off2 * 0.99 if abs(off2) > 0.1 else 0.0,
+                ]
+
+                inputData.gyroscope = fused_gyro
+                inputData.accelerometer = fused_accel
+
+    def _count_rumble_callback(self):
+        """Report how fast the game is driving rumble, once per second while active.
+
+        This runs inside the driver's native callback, which holds the GIL for its
+        duration, so the rate is also a measure of how often that thread competes
+        with input processing. Kept to a counter plus one log per second.
+        """
+        now = time.perf_counter()
+        self._rumble_cb_count += 1
+        if self._rumble_cb_window_start == 0.0:
+            self._rumble_cb_window_start = now
+            return
+        elapsed = now - self._rumble_cb_window_start
+        if elapsed >= 1.0:
+            logger.info("Rumble callbacks: %.0f/s (mode=%s driver=%s session=%s)",
+                        self._rumble_cb_count / elapsed, self.mode, self.driver_type,
+                        getattr(self, '_system_bt_pair_session_id', 'unknown'),
+                        extra={"system_bt_merged": True})
+            self._rumble_cb_count = 0
+            self._rumble_cb_window_start = now
+
+    def _publish_input_submit(self, inputData, buttons, controller, buttonsConfig):
+        """Hand the newest input frame to the submit thread and return immediately."""
+        if self._input_rate_diagnostics:
+            self._submit_published_count += 1
+        power_mode = power_saving.mode()
+        if power_mode != self._last_submit_power_mode:
+            self._full_submit_signatures.clear()
+            self._last_submit_power_mode = power_mode
+        if power_mode == "Full":
+            now = time.perf_counter()
+            def quantize_stick(stick):
+                return tuple(int(round(float(value) * 32767.0)) for value in stick)
+            signature = (
+                int(buttons), quantize_stick(inputData.left_stick),
+                quantize_stick(inputData.right_stick),
+                int(getattr(inputData, 'left_trigger', 0)),
+                int(getattr(inputData, 'right_trigger', 0)), id(buttonsConfig),
+            )
+            previous = self._full_submit_signatures.get(controller)
+            if previous is not None and previous[0] == signature and now - previous[1] < 0.05:
+                return
+            self._full_submit_signatures[controller] = (signature, now)
+            import copy
+            inputData = copy.copy(inputData)
+            inputData.gyroscope = (0.0, 0.0, 0.0)
+            inputData.accelerometer = (0.0, 0.0, 0.0)
+        with self._submit_lock:
+            if self._submit_pending is not None:
+                # The previous frame never reached the driver. Carry its presses
+                # forward so a button tapped and released between two submits is
+                # still delivered once, instead of vanishing.
+                self._submit_sticky_buttons |= self._submit_pending[1]
+                self._submit_superseded_count = getattr(
+                    self, "_submit_superseded_count", 0) + 1
+            self._submit_pending = (
+                inputData, buttons, controller, buttonsConfig,
+                self._virtual_device_generation)
+        if self._submit_thread is None or not self._submit_thread.is_alive():
+            self._start_submit_thread()
+        self._submit_wake.set()
+
+    def _start_submit_thread(self):
+        with self._submit_lock:
+            if self._submit_thread is not None and self._submit_thread.is_alive():
+                return
+            self._submit_stop = False
+            self._submit_thread = threading.Thread(
+                target=self._input_submit_loop, daemon=True, name="VirtualInputSubmit")
+            self._submit_thread.start()
+
+    def _stop_submit_thread(self):
+        self._submit_stop = True
+        self._submit_wake.set()
+        thread = self._submit_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=0.5)
+        self._submit_thread = None
+        with self._submit_lock:
+            self._submit_pending = None
+            self._submit_sticky_buttons = 0
+
+    def _input_submit_loop(self):
+        # Keep producer and consumer at the same relative priority, as in 2.2.
+        # The process-wide 1 ms GIL hand-off interval provides the required
+        # fairness without making either side starve the other.
+        while not self._submit_stop:
+            self._submit_wake.wait(timeout=0.05)
+            self._submit_wake.clear()
+            while not self._submit_stop:
+                with self._submit_lock:
+                    pending = self._submit_pending
+                    sticky = self._submit_sticky_buttons
+                    self._submit_pending = None
+                    self._submit_sticky_buttons = 0
+                if pending is None:
+                    break
+                inputData, buttons, controller, buttonsConfig, generation = pending
+                try:
+                    self._run_input_submit(
+                        inputData, buttons | sticky, controller, buttonsConfig,
+                        generation)
+                except Exception:
+                    logger.exception("Virtual input submit failed")
+
+    def _run_input_submit(self, inputData, buttons, controller, buttonsConfig,
+                          generation=None):
+        started_ns = time.perf_counter_ns()
+        self._last_submit_phase_ms = None
+        submitted = False
+        if generation is None:
+            generation = getattr(self, "_virtual_device_generation", 0)
+        # Read the mode and use its matching report under one lifetime lock.  The
+        # update_as_* locks are RLock re-entries, so this does not add another native
+        # critical section; it prevents a worker that observed PS5 just before a mode
+        # change from applying touch fields to the newly-created Xbox report.
+        with self.state_lock:
+            if generation != getattr(self, "_virtual_device_generation", 0):
+                self._submit_rejected_count = getattr(
+                    self, "_submit_rejected_count", 0) + 1
+                return False
+            mode = self.mode
+            if mode == "PS4":
+                submitted = self.update_as_ps4(inputData, buttons, controller)
+            elif mode == "PS5":
+                submitted = self.update_as_ps5(inputData, buttons, controller)
+            elif mode == "Switch2":
+                submitted = self.update_as_switch2_pro(inputData, buttons, controller)
+            elif mode == "Switch1":
+                if controller.is_pro_controller() and getattr(self, 'usbip_server_pro', None) is not None:
+                    submitted = self.update_as_switch1_pro(inputData, buttons, controller)
+                elif controller.is_joycon_left() and getattr(self, 'usbip_server_l', None) is not None:
+                    submitted = self.update_as_switch1_joycon_l(inputData, buttons, controller)
+                elif controller.is_joycon_right() and getattr(self, 'usbip_server_r', None) is not None:
+                    submitted = self.update_as_switch1_joycon_r(inputData, buttons, controller)
+            else:
+                submitted = self.update_as_xbox(
+                    inputData, buttons, controller, buttonsConfig)
+
+        elapsed_ms = (time.perf_counter_ns() - started_ns) / 1_000_000.0
+        now = time.perf_counter()
+        # Report slow end-to-end updates, with PS5 phase timings when available.
+        if elapsed_ms >= SUBMIT_SLOW_WARN_MS and now - self._last_slow_submit_warn >= SUBMIT_WARN_INTERVAL:
+            self._last_slow_submit_warn = now
+            phases = self._last_submit_phase_ms
+            if phases is None:
+                logger.warning(
+                    "Virtual controller submit took %.1f ms (mode=%s driver=%s "
+                    "superseded=%d yields=%d)",
+                    elapsed_ms, self.mode, self.driver_type,
+                    getattr(self, "_submit_superseded_count", 0),
+                    getattr(self, "_submit_cooperative_yield_count", 0))
+            else:
+                logger.warning(
+                    "Virtual controller submit took %.1f ms (mode=%s driver=%s "
+                    "lock=%.1f ms map=%.1f ms native=%.1f ms "
+                    "superseded=%d yields=%d)",
+                    elapsed_ms, self.mode, self.driver_type,
+                    phases[0], phases[1], phases[2],
+                    getattr(self, "_submit_superseded_count", 0),
+                    getattr(self, "_submit_cooperative_yield_count", 0))
+        if submitted:
+            self._submit_fail_count = 0
+        else:
+            # Previously discarded in full: update_as_* returned False and every
+            # caller ignored it, so dropped input frames were invisible.
+            self._submit_fail_count += 1
+            if now - self._last_submit_fail_warn >= SUBMIT_WARN_INTERVAL:
+                self._last_submit_fail_warn = now
+                logger.warning(
+                    "Virtual controller rejected %d input update(s) (mode=%s driver=%s) -- "
+                    "input is being dropped before it reaches the game",
+                    self._submit_fail_count, self.mode, self.driver_type)
+        if self._input_rate_diagnostics:
+            self._submit_attempted_count += 1
+            self._submit_completed_count += int(bool(submitted))
+            self._submit_rejected_count += int(not submitted)
+            self._submit_durations_ms.append(elapsed_ms)
+            elapsed = now - self._submit_rate_window_start
+            if elapsed >= 1.0:
+                superseded = max(
+                    0, self._submit_superseded_count -
+                    self._submit_diag_superseded_start)
+                durations = sorted(self._submit_durations_ms)
+                submit_avg_ms = ((sum(durations) / len(durations))
+                                 if durations else 0.0)
+                submit_p95_ms = (durations[min(
+                    len(durations) - 1, int(len(durations) * 0.95))]
+                    if durations else 0.0)
+                logger.info(
+                    "Virtual input rates: published=%.0f/s attempted=%.0f/s "
+                    "submitted=%.0f/s rejected=%d superseded=%d "
+                    "submit_avg=%.3fms submit_p95=%.3fms mode=%s driver=%s power=%s",
+                    self._submit_published_count / elapsed,
+                    self._submit_attempted_count / elapsed,
+                    self._submit_completed_count / elapsed,
+                    self._submit_rejected_count, superseded,
+                    submit_avg_ms, submit_p95_ms, self.mode, self.driver_type,
+                    power_saving.mode())
+                self._submit_published_count = 0
+                self._submit_attempted_count = 0
+                self._submit_completed_count = 0
+                self._submit_rejected_count = 0
+                self._submit_durations_ms.clear()
+                self._submit_diag_superseded_start = self._submit_superseded_count
+                self._submit_rate_window_start = now
+        return submitted
+
+    def cleanup_vg_controller(self, detach_usbip=True):
+        self._virtual_device_generation = getattr(
+            self, "_virtual_device_generation", 0) + 1
+        self._suppress_usbip_reconnect = True
+        self._stop_submit_thread()
+        self._stop_dualsense_audio_guard()
+        for suffix in ('', '_l', '_r', '_pro'):
+            port_attr = f'server_port{suffix}' if suffix else 'server_port'
+            server_attr = f'usbip_server{suffix}' if suffix else 'usbip_server'
+            
+            if hasattr(self, server_attr) and getattr(self, server_attr):
+                if detach_usbip and hasattr(self, port_attr) and getattr(self, port_attr):
+                    try:
+                        detach_usbip_device(getattr(self, port_attr))
+                    except Exception:
+                        pass
+                try:
+                    getattr(self, server_attr).stop()
+                except Exception:
+                    pass
+                setattr(self, server_attr, None)
+
+        if hasattr(self, 'vg_controller_l') and self.vg_controller_l is not None:
+            try:
+                self.vg_controller_l.unregister_notification()
+            except:
+                pass
+            try:
+                self.vg_controller_l.close()
+            except:
+                pass
+            self.vg_controller_l = None
+        if hasattr(self, 'vg_controller_r') and self.vg_controller_r is not None:
+            try:
+                self.vg_controller_r.unregister_notification()
+            except:
+                pass
+            try:
+                self.vg_controller_r.close()
+            except:
+                pass
+            self.vg_controller_r = None
+
+        if self.vg_controller is not None:
+            try:
+                self.vg_controller.unregister_notification()
+            except Exception as e:
+                logger.debug(f"Unregister notification failed: {e}")
+            if hasattr(self.vg_controller, 'cmp_func'):
+                self.vg_controller.cmp_func = None
+            if hasattr(self.vg_controller, 'close'):
+                try:
+                    self.vg_controller.close()
+                except Exception as e:
+                    logger.debug(f"Close failed: {e}")
+            if hasattr(self.vg_controller, '_devicep') and self.vg_controller._devicep:
+                try:
+                    import vgamepad.win.vigem_client as vcli
+                    if hasattr(self.vg_controller, '_busp') and self.vg_controller._busp:
+                        vcli.vigem_target_remove(self.vg_controller._busp, self.vg_controller._devicep)
+                except Exception as e:
+                    logger.debug(f"ViGEm target remove failed: {e}")
+            self.vg_controller = None
+
+    def setup_virtual_device(self):
+        with self.state_lock:
+            if self.vg_controller is None and self.running:
+                self._setup_vg_controller()
+            ready = self._submit_virtual_ready_probe()
+        if not ready:
+            raise RuntimeError("virtual device did not accept neutral readiness probe")
+
+    def _submit_virtual_ready_probe(self):
+        """Submit the already-neutral report and use its native result as readiness.
+
+        WinUHid's create call only allocates the object.  A successful input submit
+        is the first point at which the virtual device is usable by Windows.
+        """
+        if self.vg_controller is None or not hasattr(self.vg_controller, "update"):
+            return False
+        try:
+            result = self.vg_controller.update()
+            # Legacy ViGEm/USBIP helpers return None on success; the WinUHid
+            # adapters return a bool from the native ReportInput call.
+            return result is not False
+        except Exception:
+            logger.exception("Virtual device neutral readiness probe failed")
+            return False
+
+    def _setup_vg_controller(self):
+        self._virtual_device_generation = getattr(
+            self, "_virtual_device_generation", 0) + 1
+        with VIRTUAL_DEVICE_CREATION_LOCK:
+            import time
+            if not getattr(CONFIG, "virtual_driver_ready_probe", True):
+                time.sleep(0.5)
+        server_port = self.server_port
+        # Detach first while server socket is still active
+        self._suppress_usbip_reconnect = True
+        self._stop_dualsense_audio_guard()
+        detach_usbip_device(server_port)
+        if hasattr(self, 'usbip_server') and self.usbip_server:
+            try:
+                self.usbip_server.stop()
+            except Exception:
+                pass
+            self.usbip_server = None
+
+        if self.vg_controller is not None:
+            self.cleanup_vg_controller()
+            
+            # Force cleanup of the old target
+            gc.collect()
+            if not getattr(CONFIG, "virtual_driver_ready_probe", True):
+                time.sleep(0.5)
+
+        driver_type = getattr(CONFIG, "driver_type", "WinUHid")
+        self._suppress_usbip_reconnect = False
+
+        if self.mode in ("Switch1", "Switch2"):
+            import os
+            import subprocess
+            
+            # 1. Explicitly detach all Switch1 sub-ports (server_port_l/r/pro) by their
+            #    stored bus_id/host_ip, then stop the servers.
+            for suffix in ('_l', '_r', '_pro'):
+                port_attr = f'server_port{suffix}'
+                bus_attr  = f'bus_id{suffix}'
+                host_attr = f'host_ip{suffix}'
+                svr_attr  = f'usbip_server{suffix}'
+                svr = getattr(self, svr_attr, None)
+                if svr is not None:
+                    stored_port = getattr(self, port_attr, None)
+                    if stored_port is not None:
+                        try:
+                            detach_usbip_device(stored_port)
+                        except Exception:
+                            pass
+                    try:
+                        svr.stop()
+                    except Exception:
+                        pass
+                    setattr(self, svr_attr, None)
+            
+            # 2. Stop any top-level Switch2 server that might still be alive
+            self.cleanup_vg_controller()
+            
+            # Force GC to release sockets/files
+            gc.collect()
+            if not getattr(CONFIG, "virtual_driver_ready_probe", True):
+                time.sleep(0.5)
+            
+            if self.mode == "Switch2":
+                usbip_exe = get_usbip_exe_path()
+                
+                # Try to start the Switch2 server; if port is occupied, allocate a fresh one.
+                started = False
+                for attempt in range(2):
+                    try:
+                        bus_id = self.bus_id
+                        host_ip = self.host_ip
+                        mac_address = self.controllers[0].device.address if self.controllers else None
+                        
+                        if attempt > 0:
+                            # Re-allocate a fresh (host, bus_id, port) triple
+                            host_ip, bus_id, server_port = USBIPAllocator.allocate()
+                            self.host_ip   = host_ip
+                            self.bus_id    = bus_id
+                            self.server_port = server_port
+                            logger.warning(f"Switch2 port conflict for Player {self.player_number}; retrying on {host_ip}:{server_port} bus={bus_id}")
+                        
+                        detach_usbip_device(server_port)
+                        time.sleep(0.1)
+                        
+                        self.usbip_server = USBIPServer(
+                            host=host_ip, port=server_port,
+                            on_rumble_callback=self._usbip_rumble_callback,
+                            bus_id=bus_id, mac_address=mac_address
+                        )
+                        self.usbip_server.start()
+                        started = True
+                        break
+                    except Exception as e:
+                        logger.error(f"Failed to start Switch2 USBIP Server (attempt {attempt+1}): {e}")
+                        if self.usbip_server is not None:
+                            try:
+                                self.usbip_server.stop()
+                            except Exception:
+                                pass
+                            self.usbip_server = None
+                
+                if started:
+                    if os.path.exists(usbip_exe):
+                        try:
+                            detach_usbip_device(server_port)
+                            time.sleep(0.2)
+                            _sw2_attach_cmd = [usbip_exe, "-t", str(server_port), "attach", "-r", self.host_ip, "-b", self.bus_id]
+                            logger.info(f"Switch2 USBIP attach cmd: {' '.join(_sw2_attach_cmd)}")
+                            _sw2_proc = subprocess.Popen(
+                                _sw2_attach_cmd,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+                            )
+                            def _log_sw2_attach(proc, player_num, host, port, bus):
+                                try:
+                                    out, err = proc.communicate(timeout=10)
+                                    rc = proc.returncode
+                                    if out: logger.info(f"Player {player_num} SW2 attach stdout: {out.decode(errors='replace').strip()}")
+                                    if err: logger.warning(f"Player {player_num} SW2 attach stderr: {err.decode(errors='replace').strip()}")
+                                    if rc != 0:
+                                        logger.error(f"Player {player_num} SW2 attach failed (rc={rc}) on {host}:{port} bus={bus}")
+                                    else:
+                                        logger.info(f"Player {player_num} SW2 attach OK on {host}:{port} bus={bus}")
+                                except Exception as ex:
+                                    logger.warning(f"Player {player_num} SW2 attach log error: {ex}")
+                            threading.Thread(
+                                target=_log_sw2_attach,
+                                args=(_sw2_proc, self.player_number, self.host_ip, server_port, self.bus_id),
+                                daemon=True
+                            ).start()
+                            logger.info(f"Attached virtual Switch2 Controller for Player {self.player_number} via USBIP on {self.host_ip}:{server_port} bus={self.bus_id}")
+                        except Exception as e:
+                            logger.error(f"Failed to attach USBIP device: {e}")
+                    else:
+                        logger.error(f"usbip.exe not found at {usbip_exe}!")
+                else:
+                    logger.error(f"Switch2 USBIP Server for Player {self.player_number} could not be started after retries.")
+            else: # Switch1
+                from usbip_server import USBIPJoyConLServer, USBIPJoyConRServer, USBIPProControllerServer
+                self.usbip_server_l = None
+                self.usbip_server_r = None
+                self.usbip_server_pro = None
+                
+                # Check each controller
+                for c in self.controllers:
+                    mac_address = c.device.address
+                    
+                    host_ip, bus_id, port = USBIPAllocator.allocate()
+                    
+                    if c.is_joycon_left():
+                        try:
+                            self.server_port_l = port
+                            self.bus_id_l = bus_id
+                            self.host_ip_l = host_ip
+                            detach_usbip_device(port)
+                            
+                            self.usbip_server_l = USBIPJoyConLServer(host=host_ip, port=port, on_rumble_callback=lambda d, p=port: self._usbip_rumble_callback(d, side="Left"), bus_id=bus_id, mac_address=mac_address)
+                            self.usbip_server_l.start()
+                            
+                            usbip_exe = get_usbip_exe_path()
+                            if os.path.exists(usbip_exe):
+                                time.sleep(0.2)
+                                subprocess.Popen([usbip_exe, "-t", str(port), "attach", "-r", host_ip, "-b", bus_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+                                logger.info(f"Attached virtual Joy-Con (L) for Player {self.player_number} via USBIP on {host_ip}:{port}")
+                            else:
+                                logger.error(f"usbip.exe not found at {usbip_exe}!")
+                        except Exception as e:
+                            logger.error(f"Failed to initialize Joy-Con (L) USBIP server/attach: {e}")
+                            
+                    elif c.is_joycon_right():
+                        try:
+                            self.server_port_r = port
+                            self.bus_id_r = bus_id
+                            self.host_ip_r = host_ip
+                            detach_usbip_device(port)
+                            
+                            self.usbip_server_r = USBIPJoyConRServer(host=host_ip, port=port, on_rumble_callback=lambda d, p=port: self._usbip_rumble_callback(d, side="Right"), bus_id=bus_id, mac_address=mac_address)
+                            self.usbip_server_r.start()
+                            
+                            usbip_exe = get_usbip_exe_path()
+                            if os.path.exists(usbip_exe):
+                                time.sleep(0.2)
+                                subprocess.Popen([usbip_exe, "-t", str(port), "attach", "-r", host_ip, "-b", bus_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+                                logger.info(f"Attached virtual Joy-Con (R) for Player {self.player_number} via USBIP on {host_ip}:{port}")
+                            else:
+                                logger.error(f"usbip.exe not found at {usbip_exe}!")
+                        except Exception as e:
+                            logger.error(f"Failed to initialize Joy-Con (R) USBIP server/attach: {e}")
+                            
+                    elif c.is_pro_controller():
+                        try:
+                            self.server_port_pro = port
+                            self.bus_id_pro = bus_id
+                            self.host_ip_pro = host_ip
+                            detach_usbip_device(port)
+                            
+                            self.usbip_server_pro = USBIPProControllerServer(host=host_ip, port=port, on_rumble_callback=lambda d, p=port: self._usbip_rumble_callback(d, side="Pro"), bus_id=bus_id, mac_address=mac_address)
+                            self.usbip_server_pro.start()
+                            
+                            usbip_exe = get_usbip_exe_path()
+                            if os.path.exists(usbip_exe):
+                                time.sleep(0.2)
+                                subprocess.Popen([usbip_exe, "-t", str(port), "attach", "-r", host_ip, "-b", bus_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+                                logger.info(f"Attached virtual Pro Controller for Player {self.player_number} via USBIP on {host_ip}:{port}")
+                            else:
+                                logger.error(f"usbip.exe not found at {usbip_exe}!")
+                        except Exception as e:
+                            logger.error(f"Failed to initialize Pro Controller USBIP server/attach: {e}")
+                            
+                    else:
+                        logger.warning("GC Controller is temporarily excluded in Switch1 emulation mode")
+
+            class MockGamepad:
+                def __init__(self):
+                    class MockClient:
+                        is_connected = True
+                    self.client = MockClient()
+                def register_notification(self, callback_function):
+                    pass
+                def unregister_notification(self):
+                    pass
+                def update(self):
+                    pass
+                def close(self):
+                    pass
+            self.vg_controller = MockGamepad()
+            self.driver_type = "USBIP"
+        else:
+            if driver_type == "USBIP" and self.mode == "PS5":
+                logger.error("PS5 USBIP emulation has been removed in this mod. Please use Xbox One (WinUHid) or Xbox 360 (ViGEmBus).")
+                self.vg_controller = None
+                self.usbip_server = None
+            elif driver_type == "ViGEmBus":
+                try:
+                    vigem = get_vigem()
+                    if self.mode == "PS4":
+                        self.vg_controller = vigem.VDS4Gamepad()
+                        self.report_ex = DS4_REPORT_EX()
+                        self.report_ex.Report.bThumbLX = 128
+                        self.report_ex.Report.bThumbLY = 128
+                        self.report_ex.Report.bThumbRX = 128
+                        self.report_ex.Report.bThumbRY = 128
+                        self.report_ex.Report.bBatteryLvl = 0xAF
+                        self.report_ex.Report.bBatteryLvlSpecial = 0x08
+                        self.ds4_timestamp = 0
+                        logger.info("Switched to virtual PS4 controller via ViGEmBus")
+                    else:
+                        self.vg_controller = vigem.VX360Gamepad()
+                        logger.info("Switched to virtual Xbox 360 controller via ViGEmBus")
+                    self.driver_type = "ViGEmBus"
+                except Exception as e:
+                    logger.error(f"ViGEmBus initialization failed: {e}. Falling back to WinUHid.")
+                    CONFIG.driver_type = "WinUHid"
+                    CONFIG.simulation_mode = getattr(CONFIG, "winuhid_sim_mode", "PS5")
+                    self.mode = CONFIG.simulation_mode
+                    CONFIG.vigembus_installed = False
+                    CONFIG.save_config()
+                    driver_type = "WinUHid"
+
+            if driver_type == "WinUHid":
+                if self.mode == "PS4":
+                    self.vg_controller = winuhid.VDS4Gamepad()
+                    self.report = self.vg_controller.report
+                    self.report.LeftStickX = 128
+                    self.report.LeftStickY = 128
+                    self.report.RightStickX = 128
+                    self.report.RightStickY = 128
+                    self.report.BatteryLevel = 0xAF
+                    self.report.BatteryLevelSpecial = 0x08
+                    logger.info("Switched to virtual PS4 controller via WinUHid")
+                elif self.mode == "PS5":
+                    self.vg_controller = winuhid.VDS5Gamepad()
+                    self.report = self.vg_controller.report
+                    self.report.LeftStickX = 128
+                    self.report.LeftStickY = 128
+                    self.report.RightStickX = 128
+                    self.report.RightStickY = 128
+                    self.report.BatteryPercent = 8
+                    self.report.BatteryState = 2
+                    self.report.Reserved3[0] = 0x08
+                    logger.info("Switched to virtual PS5 controller via WinUHid")
+
+                else:
+                    self.vg_controller = winuhid.VX360Gamepad()
+                    logger.info("Switched to virtual Xbox 360 controller via WinUHid")
+                self.driver_type = "WinUHid"
+
+            if self.vg_controller is not None and self.mode != "Switch1":
+                if (self.mode == "Xbox One"
+                        and self.driver_type == "WinUHid"
+                        and hasattr(self.vg_controller, 'register_force_feedback_notification')):
+                    self.vg_controller.register_force_feedback_notification(
+                        self.xbox_force_feedback_callback)
+                else:
+                    self.vg_controller.register_notification(callback_function=self.vibration_callback)
+            if not getattr(CONFIG, "virtual_driver_ready_probe", True):
+                time.sleep(0.5)
+
+        self.previous_buttons_left = 0x00000000
+        self.previous_buttons_right = 0x00000000
+        self.last_s2_lx = 0.0
+        self.last_s2_ly = 0.0
+        self.last_s2_rx = 0.0
+        self.last_s2_ry = 0.0
+        self.last_s2_gx = 0
+        self.last_s2_gy = 0
+        self.last_s2_gz = 0
+        self.last_s2_ax = 0
+        self.last_s2_ay = 0
+        self.last_s2_az = 0
+        self.was_touching = False
+        self.was_touching_0 = False
+        self.was_touching_1 = False
+        self.touch_start_time = 0.0
+        update_wake = getattr(self, '_update_wake', None)
+        if update_wake is not None:
+            update_wake.set()
+
+    def set_mode(self, new_mode):
+        if self.mode != new_mode:
+            # A mode change must not leave a previously active Xbox trigger
+            # motor latched in the physical-controller output path.
+            self.clear_xbox_impulse_triggers()
+            self.reset_inputs()
+            with self.state_lock:
+                self.mode = new_mode
+                
+                if self.mode == "Switch1":
+                    self.hold_mode = "Vertical"
+                elif self.is_single() and len(self.controllers) > 0:
+                    from config import CONFIG
+                    addr = self.controllers[0].device.address
+                    if addr in CONFIG.joycon_hold_mode:
+                        self.hold_mode = CONFIG.joycon_hold_mode[addr]
+                    else:
+                        self.hold_mode = "Vertical"
+                
+                if self.vg_controller is not None:
+                    self._setup_vg_controller()
+            self.reset_inputs()
+            self._update_wake.set()
+            if self.loop and self.loop.is_running():
+                asyncio.run_coroutine_threadsafe(self.update_leds(), self.loop)
+
+    def vibration_callback(self, client, target, large_motor, small_motor, led_number, user_data):
+        if self._is_system_bt_merged_joycon_pair():
+            self._count_rumble_callback()
+        delay = getattr(CONFIG, "rumble_delay_ms", 0)
+        if delay > 0:
+            import threading
+            threading.Timer(delay / 1000.0, self._run_rumble_callback, args=(self._vibration_callback_internal, client, target, large_motor, small_motor, led_number, user_data)).start()
+        else:
+            self._run_rumble_callback(self._vibration_callback_internal, client, target, large_motor, small_motor, led_number, user_data)
+
+    def _vibration_callback_internal(self, client, target, large_motor, small_motor, led_number, user_data):
+        import math
+        import discoverer
+
+        lf_val = int(800 * large_motor / 256)
+        hf_val = int(800 * small_motor / 256)
+
+        if self.loop is None or not self.loop.is_running():
+            if discoverer.DISCOVERER_LOOP and discoverer.DISCOVERER_LOOP.is_running():
+                self.loop = discoverer.DISCOVERER_LOOP
+            else:
+                try:
+                    self.loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    pass
+
+        dt = time.perf_counter() - self.cycle_start_time
+        slot_size = RUMBLE_WRITE_INTERVAL / 3.0
+        slot = int(dt / slot_size) if slot_size > 0 else 0
+        if slot < 0:
+            slot = 0
+        elif slot > 2:
+            slot = 2
+
+        with self.vibration_lock:
+            # Accumulate into the shared buffer AND both per-side (L/R) buffers with the
+            # same (mono) value. Merged Joy-Cons each consume their OWN side buffer; the
+            # old single shared consume-once buffer let whichever Joy-Con polled first
+            # clear the rumble, so the other side read latest_vibration (0 between game
+            # updates) and stopped — that is the L/R complementary alternation. A single
+            # controller just reads its own side; the unused side is harmless.
+            for buf in (self.frame_vibrations, self.frame_vibrations_l, self.frame_vibrations_r):
+                raw_lf = buf[slot].lf_amp + lf_val
+                raw_hf = buf[slot].hf_amp + hf_val
+                # Use non-linear scaling for summation to prevent clipping
+                buf[slot].lf_amp = int(raw_lf) if raw_lf <= 560 else int(560 + 240 * math.tanh((raw_lf - 560) / 240))
+                buf[slot].hf_amp = int(raw_hf) if raw_hf <= 560 else int(560 + 240 * math.tanh((raw_hf - 560) / 240))
+
+            for lv in (self.latest_vibration, self.latest_vibration_l, self.latest_vibration_r):
+                lv.lf_amp = lf_val
+                lv.hf_amp = hf_val
+            self.vibration_dirty = True
+            self.vibration_dirty_l = True
+            self.vibration_dirty_r = True
+            self.traditional_rumble_seq = getattr(self, 'traditional_rumble_seq', 0) + 1
+
+    def xbox_force_feedback_callback(self, large_motor, small_motor, left_trigger, right_trigger):
+        """Receives one atomic Xbox One four-motor state from WinUHid."""
+        # A delayed callback must never apply after a newer four-motor packet
+        # (or after a clear/mode change) has superseded it.
+        with self.vibration_lock:
+            self._xbox_feedback_generation += 1
+            generation = self._xbox_feedback_generation
+        delay = getattr(CONFIG, "rumble_delay_ms", 0)
+        if delay > 0:
+            threading.Timer(
+                delay / 1000.0,
+                self._run_rumble_callback,
+                args=(self._xbox_force_feedback_callback_internal, large_motor, small_motor, left_trigger, right_trigger, generation),
+            ).start()
+        else:
+            self._run_rumble_callback(self._xbox_force_feedback_callback_internal,
+                large_motor, small_motor, left_trigger, right_trigger, generation)
+
+    def _xbox_force_feedback_callback_internal(self, large_motor, small_motor, left_trigger, right_trigger, generation):
+        with self.vibration_lock:
+            if generation != self._xbox_feedback_generation:
+                return
+        # Reuse the ordinary path verbatim so Xbox main-motor rumble remains
+        # mono. Impulse state is stored separately below.
+        self._vibration_callback_internal(None, None, large_motor, small_motor, 0, None)
+        impulse_enabled = getattr(CONFIG, 'impulse_trigger_enabled', True)
+        if impulse_enabled:
+            left_trigger = max(0, min(IMPULSE_RAW_MAX, int(left_trigger)))
+            right_trigger = max(0, min(IMPULSE_RAW_MAX, int(right_trigger)))
+        else:
+            # Keep ordinary main-motor rumble above intact, while ensuring a
+            # disabled feature cannot revive a stale LT/RT output state.
+            left_trigger = 0
+            right_trigger = 0
+        with self.vibration_lock:
+            now = time.perf_counter()
+
+            def update_side(side, new_raw, force_clear=False):
+                raw_name = f'xbox_impulse_raw_{side}'
+                release_name = f'xbox_impulse_release_started_{side}'
+                raw, started, changed, stopped = _next_impulse_release_state(
+                    getattr(self, raw_name, 0), getattr(self, release_name, 0.0),
+                    new_raw, now, force_clear)
+                setattr(self, raw_name, raw)
+                setattr(self, release_name, started)
+                return changed, stopped
+
+            changed_l, stopped_l = update_side('l', left_trigger, not impulse_enabled)
+            changed_r, stopped_r = update_side('r', right_trigger, not impulse_enabled)
+            if not (changed_l or changed_r):
+                return
+            self.xbox_impulse_sequence += 1
+            if changed_l:
+                self.xbox_impulse_sequence_l += 1
+            if changed_r:
+                self.xbox_impulse_sequence_r += 1
+            if stopped_l:
+                self.xbox_impulse_stop_sequence += 1
+                self.xbox_impulse_stop_sequence_l += 1
+            if stopped_r:
+                self.xbox_impulse_stop_sequence += 1
+                self.xbox_impulse_stop_sequence_r += 1
+
+    def _get_xbox_impulse_output_locked(self, side, now):
+        """Return (raw, release_scale, active), completing release if due."""
+        raw_name = f'xbox_impulse_raw_{side}'
+        release_name = f'xbox_impulse_release_started_{side}'
+        raw = int(getattr(self, raw_name, 0))
+        release_started = float(getattr(self, release_name, 0.0))
+        raw, scale, active, expired = _resolve_impulse_release(
+            raw, release_started, now)
+        if not expired:
+            return raw, scale, active
+
+        setattr(self, raw_name, raw)
+        setattr(self, release_name, 0.0)
+        self.xbox_impulse_sequence += 1
+        if side == 'l':
+            self.xbox_impulse_sequence_l += 1
+        else:
+            self.xbox_impulse_sequence_r += 1
+        return raw, scale, active
+
+    def get_xbox_impulse_state(self):
+        with self.vibration_lock:
+            now = time.perf_counter()
+            _, _, left_active = self._get_xbox_impulse_output_locked('l', now)
+            _, _, right_active = self._get_xbox_impulse_output_locked('r', now)
+            return {
+                'left_active': left_active,
+                'right_active': right_active,
+                'sequence': self.xbox_impulse_sequence,
+                'stop_sequence': self.xbox_impulse_stop_sequence,
+                'sequence_l': self.xbox_impulse_sequence_l,
+                'sequence_r': self.xbox_impulse_sequence_r,
+                'stop_sequence_l': self.xbox_impulse_stop_sequence_l,
+                'stop_sequence_r': self.xbox_impulse_stop_sequence_r,
+            }
+
+    def get_current_xbox_impulse_frames(self, is_left=True):
+        with self.vibration_lock:
+            raw, release_scale, active = self._get_xbox_impulse_output_locked(
+                'l' if is_left else 'r', time.perf_counter())
+        if not getattr(CONFIG, 'impulse_trigger_enabled', True):
+            raw = 0
+            release_scale = 0.0
+            active = False
+        frequency_raw = _impulse_release_frequency_raw(raw, release_scale)
+        frame = _map_xbox_impulse_trigger(
+            raw,
+            dynamic_frequency=getattr(CONFIG, 'impulse_trigger_dynamic_frequency', True),
+            fixed_frequency=getattr(CONFIG, 'impulse_trigger_frequency', 10),
+            frequency_raw=frequency_raw)
+        frame.impulse_scale = release_scale
+        return _copy_vibration(frame), _copy_vibration(frame), _copy_vibration(frame), not active
+
+    def clear_xbox_impulse_triggers(self):
+        with self.vibration_lock:
+            # Invalidate a pending delayed four-motor packet before it can
+            # re-enable an impulse side after this explicit clear.
+            self._xbox_feedback_generation += 1
+            if (self.xbox_impulse_raw_l == 0 and self.xbox_impulse_raw_r == 0 and
+                    self.xbox_impulse_release_started_l <= 0.0 and
+                    self.xbox_impulse_release_started_r <= 0.0):
+                return
+            left_was_active = self.xbox_impulse_raw_l > 0
+            right_was_active = self.xbox_impulse_raw_r > 0
+            self.xbox_impulse_raw_l = 0
+            self.xbox_impulse_raw_r = 0
+            self.xbox_impulse_release_started_l = 0.0
+            self.xbox_impulse_release_started_r = 0.0
+            self.xbox_impulse_sequence += 1
+            self.xbox_impulse_stop_sequence += 1
+            if left_was_active:
+                self.xbox_impulse_sequence_l += 1
+                self.xbox_impulse_stop_sequence_l += 1
+            if right_was_active:
+                self.xbox_impulse_sequence_r += 1
+                self.xbox_impulse_stop_sequence_r += 1
+
+    @staticmethod
+    def _audio_haptic_hold_candidate(vibration):
+        return max(int(getattr(vibration, 'lf_amp', 0)), int(getattr(vibration, 'hf_amp', 0))) >= AUDIO_HAPTIC_HOLD_MIN_AMPLITUDE
+
+    def _usbip_audio_stream_recent(self, now=None):
+        if self.mode != "PS5" or self.driver_type != "USBIP":
+            return False
+        now = time.perf_counter() if now is None else now
+        last_packet = getattr(self, 'last_usbip_audio_packet_time', 0.0)
+        packet_recent = last_packet > 0 and now - last_packet <= 0.5
+        return packet_recent
+
+    def _clear_traditional_rumble_locked(self):
+        was_active = getattr(self, 'traditional_rumble_active', False)
+        self.traditional_rumble_active = False
+        self.traditional_rumble_zero_keepalive_seen = False
+        for f in self.frame_vibrations_l:
+            f.lf_amp = 0
+            f.hf_amp = 0
+        for f in self.frame_vibrations_r:
+            f.lf_amp = 0
+            f.hf_amp = 0
+        self.latest_vibration_l.lf_amp = 0
+        self.latest_vibration_l.hf_amp = 0
+        self.latest_vibration_r.lf_amp = 0
+        self.latest_vibration_r.hf_amp = 0
+        self.vibration_dirty_l = True
+        self.vibration_dirty_r = True
+        if was_active:
+            self.traditional_rumble_stop_seq = getattr(self, 'traditional_rumble_stop_seq', 0) + 1
+        # Drop the stored stop signatures so a stale signature from this rumble
+        # session can never match a zero packet in a later, unrelated session.
+        self.traditional_rumble_last_zero_signature = None
+        self.traditional_rumble_last_flag_masked_signature = None
+        self._trad_rumble_pending_stop_at = None
+
+    def get_usbip_ps5_rumble_source_state(self):
+        if self.mode != "PS5" or self.driver_type != "USBIP":
+            return {
+                'traditional_active': False,
+                'trigger_active_l': False,
+                'trigger_active_r': False,
+                'audio_active_l': False,
+                'audio_active_r': False,
+                'traditional_seq': getattr(self, 'traditional_rumble_seq', 0),
+                'traditional_stop_seq': getattr(self, 'traditional_rumble_stop_seq', 0),
+                'trigger_seq': getattr(self, 'trigger_effect_seq', 0),
+                'audio_seq': getattr(self, 'audio_haptic_seq', 0),
+            }
+
+        now = time.perf_counter()
+        with self.vibration_lock:
+            # A single DualSense compatibility-rumble report has no guaranteed
+            # matching stop report. For a merged Joy-Con pair on System Bluetooth,
+            # expire the ordinary source after the same 150 ms source watchdog used
+            # by the other rumble paths. Continuous effects keep renewing
+            # _last_ordinary_rumble_time with each host report.
+            ordinary_last = getattr(self, '_last_ordinary_rumble_time', 0)
+            if (
+                self._is_system_bt_merged_joycon_pair() and
+                getattr(self, 'traditional_rumble_active', False) and
+                ordinary_last > 0 and
+                now - ordinary_last > SWITCH_RUMBLE_TIMEOUT
+            ):
+                logger.info(
+                    "Merged System-BT single-packet rumble expired after %.0fms",
+                    SWITCH_RUMBLE_TIMEOUT * 1000.0,
+                    extra={"system_bt_merged": True},
+                )
+                self._clear_traditional_rumble_locked()
+
+            pending = getattr(self, '_trad_rumble_pending_stop_at', None)
+            if (pending is not None and now >= pending and
+                    getattr(self, 'traditional_rumble_active', False)):
+                logger.info("Traditional rumble deferred STOP applied (owner silent past window)")
+                self._clear_traditional_rumble_locked()
+
+            latest_l = self.latest_vibration_l
+            latest_r = self.latest_vibration_r
+            traditional_active = (
+                getattr(self, 'traditional_rumble_active', False) or
+                getattr(self, 'vibration_dirty_l', False) or
+                getattr(self, 'vibration_dirty_r', False) or
+                int(getattr(latest_l, 'lf_amp', 0)) > 0 or
+                int(getattr(latest_l, 'hf_amp', 0)) > 0 or
+                int(getattr(latest_r, 'lf_amp', 0)) > 0 or
+                int(getattr(latest_r, 'hf_amp', 0)) > 0
+            )
+
+            audio_latest_l = self.audio_haptic_latest_vibration_l
+            audio_latest_r = self.audio_haptic_latest_vibration_r
+            audio_dirty_l = getattr(self, 'audio_haptic_vibration_dirty_l', False)
+            audio_dirty_r = getattr(self, 'audio_haptic_vibration_dirty_r', False)
+            audio_hold_l = (
+                self._audio_haptic_hold_candidate(audio_latest_l) and
+                getattr(self, 'last_haptic_l_active_time', 0) > 0 and
+                now - getattr(self, 'last_haptic_l_active_time', 0) <= SWITCH_RUMBLE_TIMEOUT
+            )
+            audio_hold_r = (
+                self._audio_haptic_hold_candidate(audio_latest_r) and
+                getattr(self, 'last_haptic_r_active_time', 0) > 0 and
+                now - getattr(self, 'last_haptic_r_active_time', 0) <= SWITCH_RUMBLE_TIMEOUT
+            )
+
+            trigger_end_l = getattr(self, 'trigger_l_punch_end', 0)
+            trigger_end_r = getattr(self, 'trigger_r_punch_end', 0)
+
+            return {
+                'traditional_active': traditional_active,
+                'trigger_active_l': now < trigger_end_l,
+                'trigger_active_r': now < trigger_end_r,
+                'audio_active_l': audio_dirty_l or audio_hold_l,
+                'audio_active_r': audio_dirty_r or audio_hold_r,
+                'traditional_seq': getattr(self, 'traditional_rumble_seq', 0),
+                'traditional_stop_seq': getattr(self, 'traditional_rumble_stop_seq', 0),
+                'trigger_seq': getattr(self, 'trigger_effect_seq', 0),
+                'audio_seq': getattr(self, 'audio_haptic_seq', 0),
+            }
+
+    @staticmethod
+    def _traditional_rumble_zero_signature(out_data):
+        sig = bytearray(out_data)
+        if len(sig) > 4:
+            sig[3] = 0
+            sig[4] = 0
+        return bytes(sig)
+
+    @staticmethod
+    def _traditional_rumble_flag_masked_signature(out_data):
+        # DualSense 0x02 USB output report: [1],[2]=valid_flag0/1, [39]=valid_flag2.
+        # Steam Input sometimes clears these on its stop packet, so the stop-detection
+        # signature must ignore them too.  Motors [3],[4] are already masked.
+        sig = bytearray(out_data)
+        for i in _TRAD_RUMBLE_SIG_MASK_OFFSETS:
+            if i < len(sig):
+                sig[i] = 0
+        return bytes(sig)
+
+    def get_current_vibration_frames(self, is_left=True):
+        if self.mode == "Switch1":
+            with self.vibration_lock:
+                vibs = self.switch_vibrations_left if is_left else self.switch_vibrations_right
+                
+                # Switch hardware timeout (Watchdog): Stop vibrating if no packet is received for 150ms
+                # (Setting this too low will cause stuttering in games that send rumble at 50ms intervals)
+                current_time = time.perf_counter()
+                last_time = getattr(self, 'last_rumble_received_time', 0)
+                
+                if current_time - last_time > SWITCH_RUMBLE_TIMEOUT:
+                    v1 = VibrationData()
+                    v2 = VibrationData()
+                    v3 = VibrationData()
+                    self.switch_vibrations_left = [VibrationData() for _ in range(3)]
+                    self.switch_vibrations_right = [VibrationData() for _ in range(3)]
+                else:
+                    v1 = _copy_vibration(vibs[0])
+                    v2 = _copy_vibration(vibs[1])
+                    v3 = _copy_vibration(vibs[2])
+                
+                if is_left:
+                    self.vibration_dirty_l = False
+                else:
+                    self.vibration_dirty_r = False
+            
+            is_zero = (v1.lf_amp == 0 and v1.hf_amp == 0 and v2.lf_amp == 0 and v2.hf_amp == 0 and v3.lf_amp == 0 and v3.hf_amp == 0)
+            return v1, v2, v3, is_zero
+
+        with self.vibration_lock:
+            use_dualsense_stereo = self.mode == "PS5" and self.driver_type == "USBIP"
+
+            if use_dualsense_stereo:
+                current_time = time.perf_counter()
+                last_received = getattr(self, 'last_rumble_received_time', 0)
+                last_active = getattr(self, 'last_rumble_active_time', 0)
+                last_time = max(last_received, last_active)
+
+                # Fallback application point for a deferred ambiguous stop: the owning
+                # source may go silent (send no more packets) after the stop, so apply it
+                # here once the window has elapsed.  This is NOT a staleness watchdog — it
+                # only fires when an explicit stop packet was received and deferred.
+                pending = getattr(self, '_trad_rumble_pending_stop_at', None)
+                if (pending is not None and current_time >= pending and
+                        getattr(self, 'traditional_rumble_active', False)):
+                    logger.info("Traditional rumble deferred STOP applied (owner silent past window)")
+                    self._clear_traditional_rumble_locked()
+
+                if is_left:
+                    latest_vibration = self.latest_vibration_l
+                    frame_vibrations = self.frame_vibrations_l
+                    vibration_dirty = self.vibration_dirty_l
+                    no_update_attr = '_audio_haptic_no_update_l'
+                else:
+                    latest_vibration = self.latest_vibration_r
+                    frame_vibrations = self.frame_vibrations_r
+                    vibration_dirty = self.vibration_dirty_r
+                    no_update_attr = '_audio_haptic_no_update_r'
+
+                if vibration_dirty:
+                    setattr(self, no_update_attr, False)
+                    if getattr(self, 'rumble_host_mode', 'audio_haptics') == 'compatibility':
+                        v1 = VibrationData(lf_amp=frame_vibrations[0].lf_amp, hf_amp=frame_vibrations[0].hf_amp, lf_freq=latest_vibration.lf_freq, hf_freq=latest_vibration.hf_freq)
+                        v2 = VibrationData(lf_amp=frame_vibrations[1].lf_amp, hf_amp=frame_vibrations[1].hf_amp, lf_freq=latest_vibration.lf_freq, hf_freq=latest_vibration.hf_freq)
+                        v3 = VibrationData(lf_amp=frame_vibrations[2].lf_amp, hf_amp=frame_vibrations[2].hf_amp, lf_freq=latest_vibration.lf_freq, hf_freq=latest_vibration.hf_freq)
+                        if v1.lf_amp == 0 and v1.hf_amp == 0:
+                            v1.lf_amp, v1.hf_amp = latest_vibration.lf_amp, latest_vibration.hf_amp
+                        if v2.lf_amp == 0 and v2.hf_amp == 0:
+                            v2.lf_amp, v2.hf_amp = v1.lf_amp, v1.hf_amp
+                        if v3.lf_amp == 0 and v3.hf_amp == 0:
+                            v3.lf_amp, v3.hf_amp = v2.lf_amp, v2.hf_amp
+                    else:
+                        v1 = _copy_vibration(frame_vibrations[0])
+                        v2 = _copy_vibration(frame_vibrations[1])
+                        v3 = _copy_vibration(frame_vibrations[2])
+                        if v1.lf_amp == 0 and v1.hf_amp == 0:
+                            v1.lf_amp, v1.hf_amp = latest_vibration.lf_amp, latest_vibration.hf_amp
+                            v1.lf_freq, v1.hf_freq = latest_vibration.lf_freq, latest_vibration.hf_freq
+                        if v2.lf_amp == 0 and v2.hf_amp == 0:
+                            v2.lf_amp, v2.hf_amp = v1.lf_amp, v1.hf_amp
+                            v2.lf_freq, v2.hf_freq = v1.lf_freq, v1.hf_freq
+                        if v3.lf_amp == 0 and v3.hf_amp == 0:
+                            v3.lf_amp, v3.hf_amp = v2.lf_amp, v2.hf_amp
+                            v3.lf_freq, v3.hf_freq = v2.lf_freq, v2.hf_freq
+
+                    _clear_vibration_buffer(frame_vibrations)
+
+                    if is_left:
+                        self.vibration_dirty_l = False
+                    else:
+                        self.vibration_dirty_r = False
+                    self.cycle_start_time = time.perf_counter()
+                else:
+                    setattr(self, no_update_attr, False)
+                    lv = latest_vibration
+                    v1 = VibrationData(lf_amp=lv.lf_amp, hf_amp=lv.hf_amp, lf_freq=lv.lf_freq, hf_freq=lv.hf_freq)
+                    v2 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp, lf_freq=v1.lf_freq, hf_freq=v1.hf_freq)
+                    v3 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp, lf_freq=v1.lf_freq, hf_freq=v1.hf_freq)
+
+                is_zero = (v1.lf_amp == 0 and v1.hf_amp == 0 and v2.lf_amp == 0 and v2.hf_amp == 0 and v3.lf_amp == 0 and v3.hf_amp == 0)
+                return v1, v2, v3, is_zero
+
+            # Read THIS controller's own side buffer. Merged L+R Joy-Cons each consume
+            # independently, so neither starves the other (the shared single-consumer
+            # buffer caused the L/R complementary alternation). A single controller just
+            # uses its own side.
+            if is_left:
+                side_frames = self.frame_vibrations_l
+                side_latest = self.latest_vibration_l
+                side_dirty = self.vibration_dirty_l
+            else:
+                side_frames = self.frame_vibrations_r
+                side_latest = self.latest_vibration_r
+                side_dirty = self.vibration_dirty_r
+
+            if side_dirty:
+                v1 = _copy_vibration(side_frames[0])
+                v2 = _copy_vibration(side_frames[1])
+                v3 = _copy_vibration(side_frames[2])
+
+                if v1.lf_amp == 0 and v1.hf_amp == 0:
+                    v1.lf_amp, v1.hf_amp = side_latest.lf_amp, side_latest.hf_amp
+                    v1.lf_freq, v1.hf_freq = side_latest.lf_freq, side_latest.hf_freq
+                if v2.lf_amp == 0 and v2.hf_amp == 0:
+                    v2.lf_amp, v2.hf_amp = v1.lf_amp, v1.hf_amp
+                    v2.lf_freq, v2.hf_freq = v1.lf_freq, v1.hf_freq
+                if v3.lf_amp == 0 and v3.hf_amp == 0:
+                    v3.lf_amp, v3.hf_amp = v2.lf_amp, v2.hf_amp
+                    v3.lf_freq, v3.hf_freq = v2.lf_freq, v2.hf_freq
+
+                _clear_vibration_buffer(side_frames)
+                if is_left:
+                    self.vibration_dirty_l = False
+                else:
+                    self.vibration_dirty_r = False
+                self.cycle_start_time = time.perf_counter()
+            else:
+                now = time.perf_counter()
+                side_last_active = getattr(self,
+                    'last_haptic_l_active_time' if is_left else 'last_haptic_r_active_time', 0)
+                sl = side_latest
+                audio_haptic_expired = (
+                    side_last_active > 0 and
+                    now - side_last_active > SWITCH_RUMBLE_TIMEOUT
+                )
+                # The ordinary scheduler reads side_latest on every tick. Without
+                # this source watchdog, one host rumble packet is indistinguishable
+                # from a continuous effect and perpetually renews the pair
+                # coordinator's hold-last payload. Limit this behavior strictly to
+                # merged Joy-Con over System Bluetooth; all other transports retain
+                # their existing semantics.
+                traditional_last_active = getattr(self, 'last_rumble_active_time', 0)
+                traditional_expired = (
+                    self._is_system_bt_merged_joycon_pair() and
+                    traditional_last_active > 0 and
+                    now - traditional_last_active > SWITCH_RUMBLE_TIMEOUT and
+                    not (side_last_active > 0 and
+                         now - side_last_active <= SWITCH_RUMBLE_TIMEOUT)
+                )
+                if audio_haptic_expired or traditional_expired:
+                    sl = _zero_vibration()
+                v1 = _copy_vibration(sl)
+                v2 = _copy_vibration(sl)
+                v3 = _copy_vibration(sl)
+                self.cycle_start_time = time.perf_counter()
+
+            is_zero = (v1.lf_amp == 0 and v1.hf_amp == 0 and v2.lf_amp == 0 and v2.hf_amp == 0 and v3.lf_amp == 0 and v3.hf_amp == 0)
+            return v1, v2, v3, is_zero
+
+    def get_current_adaptive_trigger_frames(self, is_left=True):
+        if (
+            not USBIP_PS5_CONCURRENT_RUMBLE_TEST
+            or self.mode != "PS5"
+            or not getattr(CONFIG, "adaptive_triggers_enabled", True)
+        ):
+            empty = _zero_vibration(hf_freq=0x0e1)
+            return empty, _zero_vibration(hf_freq=0x0e1), _zero_vibration(hf_freq=0x0e1), True
+
+        current_time = time.perf_counter()
+        trigger_end = getattr(self, 'trigger_l_punch_end' if is_left else 'trigger_r_punch_end', 0)
+        if current_time >= trigger_end:
+            empty = _zero_vibration(hf_freq=0x0e1)
+            return empty, _zero_vibration(hf_freq=0x0e1), _zero_vibration(hf_freq=0x0e1), True
+
+        is_joycon = any(c.is_joycon() for c in getattr(self, 'controllers', []))
+        trigger_amp = int(800 * 0.5) if is_joycon else 800
+        v1 = VibrationData(lf_amp=trigger_amp, hf_amp=trigger_amp, lf_freq=0x0e1, hf_freq=0x0e1)
+        v2 = _copy_vibration(v1)
+        v3 = _copy_vibration(v1)
+        return v1, v2, v3, False
+
+    def get_current_audio_haptic_frames(self, is_left=True):
+        if (
+            not USBIP_PS5_CONCURRENT_RUMBLE_TEST
+            or self.mode != "PS5"
+        ):
+            empty = _zero_vibration()
+            return empty, _zero_vibration(), _zero_vibration(), True
+
+        with self.vibration_lock:
+            current_time = time.perf_counter()
+            if is_left:
+                latest_vibration = self.audio_haptic_latest_vibration_l
+                frame_vibrations = self.audio_haptic_frame_vibrations_l
+                vibration_dirty = self.audio_haptic_vibration_dirty_l
+            else:
+                latest_vibration = self.audio_haptic_latest_vibration_r
+                frame_vibrations = self.audio_haptic_frame_vibrations_r
+                vibration_dirty = self.audio_haptic_vibration_dirty_r
+
+            if vibration_dirty:
+                v1 = _copy_vibration(frame_vibrations[0])
+                v2 = _copy_vibration(frame_vibrations[1])
+                v3 = _copy_vibration(frame_vibrations[2])
+                
+                ttl = getattr(self, 'audio_haptic_ttl_l' if is_left else 'audio_haptic_ttl_r', 0)
+                if ttl > 0:
+                    ttl -= 1
+                    if is_left:
+                        self.audio_haptic_ttl_l = ttl
+                    else:
+                        self.audio_haptic_ttl_r = ttl
+
+                if ttl <= 0:
+                    _clear_vibration_buffer(frame_vibrations)
+                    if is_left:
+                        self.audio_haptic_vibration_dirty_l = False
+                    else:
+                        self.audio_haptic_vibration_dirty_r = False
+            else:
+                lv = latest_vibration
+                v1 = _copy_vibration(lv)
+                v2 = _copy_vibration(lv)
+                v3 = _copy_vibration(lv)
+
+            is_zero = (v1.lf_amp == 0 and v1.hf_amp == 0 and v2.lf_amp == 0 and v2.hf_amp == 0 and v3.lf_amp == 0 and v3.hf_amp == 0)
+            return v1, v2, v3, is_zero
+
+    async def init_added_controller(self, controller: Controller, update_leds=True):
+        controller.virtual_controller = self
+        self.loop = asyncio.get_running_loop()
+        if self.vibration_changed_event is None:
+            self.vibration_changed_event = asyncio.Event()
+        if update_leds:
+            await self.update_leds()
+
+        if self.mode == "Switch1":
+            self.hold_mode = "Vertical"
+            from usbip_server import USBIPJoyConLServer, USBIPJoyConRServer, USBIPProControllerServer
+            import os
+            import subprocess
+            from utils import USBIPAllocator
+            
+            mac_address = controller.device.address
+            if controller.is_joycon_left() and getattr(self, 'usbip_server_l', None) is None:
+                host_ip, bus_id, port = USBIPAllocator.allocate()
+                self.server_port_l = port
+                self.bus_id_l = bus_id
+                self.host_ip_l = host_ip
+                try:
+                    detach_usbip_device(port)
+                except Exception:
+                    pass
+                self.usbip_server_l = USBIPJoyConLServer(host=host_ip, port=port, on_rumble_callback=lambda d, p=port: self._usbip_rumble_callback(d, side="Left"), bus_id=bus_id, mac_address=mac_address)
+                self.usbip_server_l.start()
+                usbip_exe = get_usbip_exe_path()
+                if os.path.exists(usbip_exe):
+                    time.sleep(0.2)
+                    subprocess.Popen([usbip_exe, "-t", str(port), "attach", "-r", host_ip, "-b", bus_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+                    logger.info(f"Re-Attached virtual Joy-Con (L) for Player {self.player_number} via USBIP on {host_ip}:{port}")
+            elif controller.is_joycon_right() and getattr(self, 'usbip_server_r', None) is None:
+                host_ip, bus_id, port = USBIPAllocator.allocate()
+                self.server_port_r = port
+                self.bus_id_r = bus_id
+                self.host_ip_r = host_ip
+                try:
+                    detach_usbip_device(port)
+                except Exception:
+                    pass
+                self.usbip_server_r = USBIPJoyConRServer(host=host_ip, port=port, on_rumble_callback=lambda d, p=port: self._usbip_rumble_callback(d, side="Right"), bus_id=bus_id, mac_address=mac_address)
+                self.usbip_server_r.start()
+                usbip_exe = get_usbip_exe_path()
+                if os.path.exists(usbip_exe):
+                    time.sleep(0.2)
+                    subprocess.Popen([usbip_exe, "-t", str(port), "attach", "-r", host_ip, "-b", bus_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+                    logger.info(f"Re-Attached virtual Joy-Con (R) for Player {self.player_number} via USBIP on {host_ip}:{port}")
+            elif controller.is_pro_controller() and getattr(self, 'usbip_server_pro', None) is None:
+                host_ip, bus_id, port = USBIPAllocator.allocate()
+                self.server_port_pro = port
+                self.bus_id_pro = bus_id
+                self.host_ip_pro = host_ip
+                try:
+                    detach_usbip_device(port)
+                except Exception:
+                    pass
+                self.usbip_server_pro = USBIPProControllerServer(host=host_ip, port=port, on_rumble_callback=lambda d, p=port: self._usbip_rumble_callback(d, side="Pro"), bus_id=bus_id, mac_address=mac_address)
+                self.usbip_server_pro.start()
+                usbip_exe = get_usbip_exe_path()
+                if os.path.exists(usbip_exe):
+                    time.sleep(0.2)
+                    subprocess.Popen([usbip_exe, "-t", str(port), "attach", "-r", host_ip, "-b", bus_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+                    logger.info(f"Re-Attached virtual Pro Controller for Player {self.player_number} via USBIP on {host_ip}:{port}")
+            
+            if self.vg_controller is None:
+                class MockGamepad:
+                    def __init__(self):
+                        class MockClient:
+                            is_connected = True
+                        self.client = MockClient()
+                    def register_notification(self, callback_function):
+                        pass
+                    def unregister_notification(self):
+                        pass
+                    def update(self):
+                        pass
+                    def close(self):
+                        pass
+                self.vg_controller = MockGamepad()
+                self.driver_type = "USBIP"
+        elif self.is_single() and controller.is_joycon():
+            addr = controller.device.address
+            if addr in CONFIG.joycon_hold_mode:
+                self.hold_mode = CONFIG.joycon_hold_mode[addr]
+                logger.info(f"Loaded hold mode '{self.hold_mode}' for Joy-Con {addr}")
+        elif len(self.controllers) == 2:
+            left_mac = None
+            right_mac = None
+            for c in self.controllers:
+                if c.is_joycon_left():
+                    left_mac = c.device.address
+                elif c.is_joycon_right():
+                    right_mac = c.device.address
+            if left_mac and right_mac:
+                key = f"{left_mac}+{right_mac}"
+                if key in CONFIG.merged_gyro_side:
+                    self.active_gyro_side = CONFIG.merged_gyro_side[key]
+                    logger.info(f"Loaded merged active gyro side '{self.active_gyro_side}' for combination {key}")
+        
+        # Reset Gyro Mouse state to prevent leftover state after Split/Merge
+        controller.gyro_mouse_enabled = False
+        controller.gr_was_pressed = False
+        controller.prev_zr = False
+        controller.prev_zl = False
+        controller._own_gyro_trigger = False
+        controller._shared_gyro_trigger = False
+        controller._own_zr_pressed = False
+        controller._shared_zr_pressed = False
+        controller._own_zl_pressed = False
+        controller._shared_zl_pressed = False
+        controller._last_raw_buttons = 0
+        controller._own_mode_shift_toggle = False
+        controller._own_mode_shift_tap_edge = False
+        controller._own_mode_shift_hold_pressed = False
+        controller._own_mode_shift_active = False
+        controller._shared_mode_shift_toggle = False
+        controller._shared_mode_shift_hold_pressed = False
+        controller._shared_mode_shift_active = False
+        controller._shared_in_app_gyro_toggle = False
+        controller._shared_in_app_gyro_hold_pressed = False
+        controller._shared_dampening_btn_states = {}
+        controller.gyro_target_vx = 0.0
+        controller.gyro_target_vy = 0.0
+        controller._request_interpolation_reset()
+        controller.gyro_steering_origin_accel = None
+        
+        def input_report_callback(inputData: ControllerInputData, controller: Controller):
+            if self.vg_controller is None:
+                return False
+            controllers = getattr(self, "_controllers_tuple", None)
+            if controllers is None or len(controllers) != len(self.controllers):
+                self._refresh_controller_cache()
+                controllers = self._controllers_tuple
+                
+            # Xbox One, Xbox360, PS4, PS5: abxy_mode=="Switch" triggers Switch layout swap.
+            # Switch2 uses abxy_mode=="Xbox" (inverted naming convention).
+            if self.mode == "Switch2" or self.mode == "Switch1":
+                is_switch_layout = (CONFIG.abxy_mode == "Xbox")
+            else:
+                is_switch_layout = (CONFIG.abxy_mode == "Switch")
+            
+            if len(controllers) == 2 or controller.is_pro_controller():
+                if getattr(CONFIG, "djg_enabled", False):
+                    mode = getattr(CONFIG, "djg_mode", "Single Side Toggle")
+                    if mode == "Switch Gyro Side":
+                        controller.gyro_active = (controller.is_joycon_left() and self.active_gyro_side == "Left") or (controller.is_joycon_right() and self.active_gyro_side == "Right") or controller.is_pro_controller()
+                    else:
+                        controller.gyro_active = (controller.is_joycon_left() and getattr(self, 'djg_left_active', True)) or (controller.is_joycon_right() and getattr(self, 'djg_right_active', True))
+                else:
+                    controller.gyro_active = (controller.is_joycon_left() and self.active_gyro_side == "Left") or (controller.is_joycon_right() and self.active_gyro_side == "Right") or controller.is_pro_controller()
+                controller.hold_mode = "Vertical"
+            else:
+                controller.gyro_active = True
+                controller.hold_mode = getattr(self, "hold_mode", "Vertical")
+            
+            # In combined mode, share gyro trigger from any side to all controllers
+            # Allows the gyro-active controller to receive the trigger signal
+            is_merged = getattr(self, "_is_merged_pair", False)
+            for c in controllers:
+                c.is_merged = is_merged
+
+            if is_merged:
+                left_c, right_c = getattr(self, "_merged_pair", (None, None))
+                other_c = right_c if controller is left_c else left_c
+                direct_merge = self._is_djg_none_merge()
+                # The In-App Gyro activation trigger is shared across both Joy-Cons in every
+                # merged mode: a trigger button on either side activates gyro regardless of
+                # which Joy-Con's IMU is currently feeding the output. Previously DJG modes
+                # used a per-side trigger, which made a button on the non-gyro side (Switch
+                # Gyro Side) or the toggled-off / non-dominant side (Single Side Toggle /
+                # Switch Dominant Side) unable to activate gyro at all. Double mouse output
+                # when both sides are gyro-active is prevented in gyro_fusion_callback, which
+                # makes the non-dominant (sub) side skip its own gyro-mouse emission so only
+                # the dominant side emits the fused motion.
+                # Consume Tap edges, resolve Hold state, and publish the producer
+                # lifecycle as one short atomic operation. Nothing driver-facing is
+                # allowed under this lock.
+                with self.merged_input_lock:
+                    if not hasattr(self, '_in_app_gyro_shared_toggle'):
+                        self._in_app_gyro_shared_toggle = False
+                    if getattr(controller, '_own_in_app_gyro_tap_edge', False):
+                        self._in_app_gyro_shared_toggle = not self._in_app_gyro_shared_toggle
+                        controller._own_in_app_gyro_tap_edge = False
+                    shared_in_app_gyro_toggle = bool(self._in_app_gyro_shared_toggle)
+                    shared_in_app_gyro_hold_pressed = (
+                        getattr(left_c, '_own_in_app_gyro_hold_pressed', False) or
+                        getattr(right_c, '_own_in_app_gyro_hold_pressed', False)
+                    )
+                    shared_in_app_gyro = (
+                        shared_in_app_gyro_toggle != shared_in_app_gyro_hold_pressed)
+                    _sync_merged_in_app_gyro_state(
+                        controllers, shared_in_app_gyro)
+
+                # Commit the Trigger Dampening / Trigger Deadzone source key only when the
+                # shared In-app Gyro state transitions off->on. The controller whose report
+                # is being processed is the one that caused the activation, so its pending key
+                # (the button just pressed this report) becomes the shared source. A press
+                # while gyro is already active, or a Tap that closes gyro, must not change it.
+                prev_shared_active = getattr(self, "_prev_shared_in_app_gyro_active", False)
+                if shared_in_app_gyro and not prev_shared_active:
+                    # The two Joy-Con callbacks run on separate threads, so the one that first
+                    # observes the off->on edge may not be the side that pressed. Attribute the
+                    # commit to whichever side actually has a fresh pending key (prefer the
+                    # current controller). Each side's pending key is set every report to its
+                    # own new_trigger_key (None when not pressing), so exactly the presser holds
+                    # one at the activation edge.
+                    commit_c = None
+                    for cand in (controller, left_c, right_c):
+                        if cand is not None and getattr(cand, "_pending_in_app_gyro_trigger_key", None):
+                            commit_c = cand
+                            break
+                    if commit_c is not None:
+                        pending_key = commit_c._pending_in_app_gyro_trigger_key
+                        pending_side = getattr(commit_c, "_pending_in_app_gyro_trigger_side", None)
+                        commit_time = time.perf_counter()
+                        commit_c._last_in_app_gyro_trigger_key = pending_key
+                        commit_c._last_in_app_gyro_trigger_time = commit_time
+                        commit_c._own_last_in_app_gyro_trigger_key = pending_key
+                        commit_c._own_last_in_app_gyro_trigger_time = commit_time
+                        # Carry the triggering side so Deadzone/Dampening (applied by the
+                        # dominant gyro side) can read the IR-triggering side's per-side tuning.
+                        commit_c._last_in_app_gyro_trigger_side = pending_side
+                        commit_c._own_last_in_app_gyro_trigger_side = pending_side
+                self._prev_shared_in_app_gyro_active = shared_in_app_gyro
+
+                # Pick the shared source key (and its triggering side) from whichever side
+                # most recently activated.
+                left_time = getattr(left_c, '_own_last_in_app_gyro_trigger_time', 0.0)
+                right_time = getattr(right_c, '_own_last_in_app_gyro_trigger_time', 0.0)
+                if left_time >= right_time:
+                    shared_last_in_app_gyro_trigger_key = getattr(left_c, '_own_last_in_app_gyro_trigger_key', None)
+                    shared_last_in_app_gyro_trigger_side = getattr(left_c, '_own_last_in_app_gyro_trigger_side', None)
+                else:
+                    shared_last_in_app_gyro_trigger_key = getattr(right_c, '_own_last_in_app_gyro_trigger_key', None)
+                    shared_last_in_app_gyro_trigger_side = getattr(right_c, '_own_last_in_app_gyro_trigger_side', None)
+
+                shared_gyro = shared_in_app_gyro
+
+                # Sync ZR/ZL for Gyro Mouse clicks
+                shared_zr = (
+                    getattr(left_c, '_own_zr_pressed', False) or
+                    getattr(right_c, '_own_zr_pressed', False)
+                )
+                shared_zl = (
+                    getattr(left_c, '_own_zl_pressed', False) or
+                    getattr(right_c, '_own_zl_pressed', False)
+                )
+
+                # Mode Shift back button: triggering it on either Joy-Con applies the Mode
+                # Shift mapping layer to both sides. Merged Joy-Cons use one shared Tap
+                # toggle; per-side toggles cannot be ORed because a right-side Tap must be
+                # able to close a left-side Tap-entered Mode Shift.
+                in_app_gyro_mode_shift = bool(shared_gyro and getattr(CONFIG, "mode_shift_enabled", False))
+                prev_in_app_gyro_mode_shift = getattr(self, "_prev_in_app_gyro_mode_shift", False)
+                if prev_in_app_gyro_mode_shift and not in_app_gyro_mode_shift:
+                    self._mode_shift_shared_toggle = False
+                self._prev_in_app_gyro_mode_shift = in_app_gyro_mode_shift
+
+                if not hasattr(self, '_mode_shift_shared_toggle'):
+                    self._mode_shift_shared_toggle = False
+                if getattr(controller, '_own_mode_shift_tap_edge', False):
+                    self._mode_shift_shared_toggle = not self._mode_shift_shared_toggle
+                    controller._own_mode_shift_tap_edge = False
+                shared_mode_shift_toggle = bool(self._mode_shift_shared_toggle)
+                shared_mode_shift_hold_pressed = (
+                    getattr(left_c, '_own_mode_shift_hold_pressed', False) or
+                    getattr(right_c, '_own_mode_shift_hold_pressed', False)
+                )
+                shared_mode_shift = shared_mode_shift_toggle != shared_mode_shift_hold_pressed
+
+                # Sync Steer Value and gyro-driven right stick output.
+                shared_steer = 0.0
+                shared_rs = (0.0, 0.0)
+                shared_gyro_rs = (0.0, 0.0)
+                for c in controllers:
+                    # A sub side that skipped gyro-mouse emission (both sides active) has zeroed
+                    # its own steer/rstick output; exclude it so it can't clobber the dominant
+                    # side's fused output when it is iterated last.
+                    if getattr(c, 'gyro_active', False) and not getattr(c, '_skip_gyro_mouse', False):
+                        own_steer = getattr(c, '_own_steer_value', 0.0)
+                        if direct_merge:
+                            shared_steer += own_steer
+                        else:
+                            shared_steer = own_steer
+                        if getattr(c, 'gyro_mouse_enabled', False) or shared_gyro:
+                            own_rs = getattr(c, '_gyro_rstick_out', (0.0, 0.0))
+                            if direct_merge:
+                                shared_gyro_rs = (shared_gyro_rs[0] + own_rs[0], shared_gyro_rs[1] + own_rs[1])
+                            else:
+                                shared_gyro_rs = own_rs
+                    if c.is_joycon_right():
+                        shared_rs = inputData.right_stick if c == controller else getattr(c, '_last_rs', (0.0, 0.0))
+                if direct_merge:
+                    shared_steer = max(-1.0, min(1.0, shared_steer))
+                    shared_gyro_rs = self._clamp_stick_pair(shared_gyro_rs)
+
+                for c in controllers:
+                    c._shared_gyro_trigger = shared_gyro
+                    c._shared_in_app_gyro_toggle = shared_in_app_gyro_toggle
+                    c._shared_in_app_gyro_hold_pressed = shared_in_app_gyro_hold_pressed
+                    c._shared_last_in_app_gyro_trigger_key = shared_last_in_app_gyro_trigger_key
+                    c._shared_last_in_app_gyro_trigger_side = shared_last_in_app_gyro_trigger_side
+                    c._shared_zr_pressed = shared_zr
+                    c._shared_zl_pressed = shared_zl
+                    c._shared_mode_shift_toggle = shared_mode_shift_toggle
+                    c._shared_mode_shift_hold_pressed = shared_mode_shift_hold_pressed
+                    c._shared_mode_shift_active = shared_mode_shift
+                    c._shared_steer_value = shared_steer
+                    c._shared_gyro_rstick_out = shared_gyro_rs
+                    c._shared_right_stick = shared_rs
+                
+                if controller.is_joycon_right():
+                    controller._last_rs = inputData.right_stick
+                
+            else:
+                # If not merged, ensure we don't use a stale shared steer value
+                controller._shared_steer_value = getattr(controller, '_own_steer_value', 0.0)
+                controller._shared_gyro_rstick_out = getattr(controller, '_gyro_rstick_out', (0.0, 0.0))
+                controller._shared_gyro_trigger = getattr(controller, '_own_gyro_trigger', False)
+                controller._shared_in_app_gyro_toggle = getattr(controller, '_own_in_app_gyro_toggle', False)
+                controller._shared_in_app_gyro_hold_pressed = getattr(controller, '_own_in_app_gyro_hold_pressed', False)
+                controller._shared_last_in_app_gyro_trigger_key = getattr(controller, '_own_last_in_app_gyro_trigger_key', None)
+                controller._shared_zr_pressed = getattr(controller, '_own_zr_pressed', False)
+                controller._shared_zl_pressed = getattr(controller, '_own_zl_pressed', False)
+                controller._shared_mode_shift_toggle = getattr(controller, '_own_mode_shift_toggle', False)
+                controller._shared_mode_shift_hold_pressed = getattr(controller, '_own_mode_shift_hold_pressed', False)
+                controller._shared_mode_shift_active = getattr(controller, '_own_mode_shift_active', False)
+                
+            current_buttons = inputData.buttons 
+            if is_merged and self._is_djg_none_merge():
+                side = "Left" if controller.is_joycon_left() else ("Right" if controller.is_joycon_right() else None)
+                if side:
+                    self.djg_direct_cached_gyro[side] = inputData.gyroscope
+                    self.djg_direct_cached_accel[side] = inputData.accelerometer
+            
+            # Mouse mappings consume stick input in controller.py. Gyro mouse alone should not
+            # force-disable the virtual right stick.
+            any_mouse_active = False
+            for c in controllers:
+                if getattr(c, 'jc_mouse_active', False) or getattr(c, 'joystick_mouse_active', False):
+                    any_mouse_active = True
+                    break
+            if any_mouse_active:
+                inputData.right_stick = (0.0, 0.0)
+
+            # In-app Gyro "R Joystick" control mode: gyro motion drives the virtual right
+            # stick. Add the gyro-derived deflection from the gyro-active controller and
+            # clamp to the stick's maximum (unit magnitude).
+            gyro_rstick_overlay = (0.0, 0.0)
+            if getattr(CONFIG, "gyro_control_mode", "Mouse") == "R Joystick":
+                gyro_rs = (0.0, 0.0)
+                if is_merged:
+                    gyro_rs = getattr(controller, '_shared_gyro_rstick_out', (0.0, 0.0))
+                elif getattr(controller, 'gyro_mouse_enabled', False):
+                    gyro_rs = getattr(controller, '_gyro_rstick_out', (0.0, 0.0))
+                if gyro_rs[0] != 0.0 or gyro_rs[1] != 0.0:
+                    if controller.is_joycon():
+                        gyro_rstick_overlay = gyro_rs
+                    else:
+                        rx = inputData.right_stick[0] + gyro_rs[0]
+                        ry = inputData.right_stick[1] + gyro_rs[1]
+                        inputData.right_stick = self._clamp_stick_magnitude((rx, ry))
+
+            if len(self.controllers) == 1 and self.mode != "Switch1":
+                custom_btns = getattr(inputData, 'custom_buttons_mask', 0)
+                custom_btns &= current_buttons
+                current_buttons &= ~custom_btns
+                custom_stick_route = getattr(inputData, 'custom_joystick_mapping', None)
+
+                def apply_custom_stick_route():
+                    if not custom_stick_route:
+                        return
+                    sx, sy = custom_stick_route.get("stick", (0, 0))
+                    if custom_stick_route.get("source") == "gyro":
+                        if self.hold_mode == "Horizontal":
+                            if controller.is_joycon_left():
+                                sx, sy = -sy, sx
+                            elif controller.is_joycon_right():
+                                sx, sy = sy, -sx
+                    elif self.hold_mode == "Horizontal":
+                        if custom_stick_route.get("source") == "left":
+                            sx, sy = -sy, sx
+                        elif custom_stick_route.get("source") == "right":
+                            sx, sy = sy, -sx
+                    if custom_stick_route.get("target") == "left":
+                        inputData.left_stick = (sx, sy)
+                        inputData.right_stick = (0, 0)
+                    elif custom_stick_route.get("target") == "right":
+                        inputData.left_stick = (0, 0)
+                        inputData.right_stick = (sx, sy)
+
+                if controller.is_joycon_left():
+                    if self.hold_mode == "Vertical":
+                        if not custom_stick_route:
+                            inputData.right_stick = inputData.left_stick
+                            inputData.left_stick = (0, 0)
+                        else:
+                            apply_custom_stick_route()
+                        
+                        new_btns = current_buttons & ~(SWITCH_BUTTONS["UP"] | SWITCH_BUTTONS["DOWN"] | SWITCH_BUTTONS["LEFT"] | SWITCH_BUTTONS["RIGHT"] | SWITCH_BUTTONS["L"] | SWITCH_BUTTONS["ZL"] | SWITCH_BUTTONS["L_STK"] | SWITCH_BUTTONS["MINUS"])
+                        
+                        if current_buttons & SWITCH_BUTTONS["L_STK"]:
+                            new_btns |= SWITCH_BUTTONS["R_STK"]
+                            
+                        if is_switch_layout:
+                            if current_buttons & SWITCH_BUTTONS["UP"]: new_btns |= SWITCH_BUTTONS["Y"]
+                            if current_buttons & SWITCH_BUTTONS["DOWN"]: new_btns |= SWITCH_BUTTONS["A"]
+                            if current_buttons & SWITCH_BUTTONS["LEFT"]: new_btns |= SWITCH_BUTTONS["X"]
+                            if current_buttons & SWITCH_BUTTONS["RIGHT"]: new_btns |= SWITCH_BUTTONS["B"]
+                        else:
+                            if current_buttons & SWITCH_BUTTONS["UP"]: new_btns |= SWITCH_BUTTONS["X"]
+                            if current_buttons & SWITCH_BUTTONS["DOWN"]: new_btns |= SWITCH_BUTTONS["B"]
+                            if current_buttons & SWITCH_BUTTONS["LEFT"]: new_btns |= SWITCH_BUTTONS["Y"]
+                            if current_buttons & SWITCH_BUTTONS["RIGHT"]: new_btns |= SWITCH_BUTTONS["A"]
+                            
+                        if current_buttons & SWITCH_BUTTONS["L"]: new_btns |= SWITCH_BUTTONS["R"]
+                        if current_buttons & SWITCH_BUTTONS["ZL"]: new_btns |= SWITCH_BUTTONS["ZR"]
+                        if current_buttons & SWITCH_BUTTONS["MINUS"]: new_btns |= SWITCH_BUTTONS["PLUS"]
+                        current_buttons = new_btns
+                        
+                    elif self.hold_mode == "Horizontal":
+                        if not custom_stick_route:
+                            lx, ly = inputData.left_stick
+                            inputData.left_stick = (-ly, lx)
+                            inputData.right_stick = (0, 0)
+                        else:
+                            apply_custom_stick_route()
+                        
+                        new_btns = current_buttons & ~(SWITCH_BUTTONS["UP"] | SWITCH_BUTTONS["DOWN"] | SWITCH_BUTTONS["LEFT"] | SWITCH_BUTTONS["RIGHT"] | SWITCH_BUTTONS["SL_L"] | SWITCH_BUTTONS["SR_L"] | SWITCH_BUTTONS["L"] | SWITCH_BUTTONS["ZL"] | SWITCH_BUTTONS["MINUS"])
+                        
+                        if is_switch_layout:
+                            if current_buttons & SWITCH_BUTTONS["UP"]: new_btns |= SWITCH_BUTTONS["X"]
+                            if current_buttons & SWITCH_BUTTONS["DOWN"]: new_btns |= SWITCH_BUTTONS["B"]
+                            if current_buttons & SWITCH_BUTTONS["LEFT"]: new_btns |= SWITCH_BUTTONS["A"]
+                            if current_buttons & SWITCH_BUTTONS["RIGHT"]: new_btns |= SWITCH_BUTTONS["Y"]
+                        else:
+                            if current_buttons & SWITCH_BUTTONS["UP"]: new_btns |= SWITCH_BUTTONS["Y"]
+                            if current_buttons & SWITCH_BUTTONS["DOWN"]: new_btns |= SWITCH_BUTTONS["A"]
+                            if current_buttons & SWITCH_BUTTONS["LEFT"]: new_btns |= SWITCH_BUTTONS["B"]
+                            if current_buttons & SWITCH_BUTTONS["RIGHT"]: new_btns |= SWITCH_BUTTONS["X"]
+                            
+                        if current_buttons & SWITCH_BUTTONS["SL_L"]: new_btns |= SWITCH_BUTTONS["ZL"]
+                        if current_buttons & SWITCH_BUTTONS["SR_L"]: new_btns |= SWITCH_BUTTONS["ZR"]
+                        if current_buttons & SWITCH_BUTTONS["MINUS"]: new_btns |= SWITCH_BUTTONS["PLUS"]
+                        current_buttons = new_btns
+                elif controller.is_joycon_right():
+                    if self.hold_mode == "Vertical":
+                        if custom_stick_route:
+                            apply_custom_stick_route()
+                    elif self.hold_mode == "Horizontal":
+                        if not custom_stick_route:
+                            rx, ry = inputData.right_stick
+                            inputData.right_stick = (ry, -rx)
+                        else:
+                            apply_custom_stick_route()
+                        new_btns = current_buttons & ~(SWITCH_BUTTONS["X"] | SWITCH_BUTTONS["Y"] | SWITCH_BUTTONS["A"] | SWITCH_BUTTONS["B"] | SWITCH_BUTTONS["SL_R"] | SWITCH_BUTTONS["SR_R"] | SWITCH_BUTTONS["R"] | SWITCH_BUTTONS["ZR"] | SWITCH_BUTTONS["PLUS"] | SWITCH_BUTTONS["R_STK"])
+                        
+                        if is_switch_layout:
+                            if current_buttons & SWITCH_BUTTONS["A"]: new_btns |= SWITCH_BUTTONS["X"]
+                            if current_buttons & SWITCH_BUTTONS["X"]: new_btns |= SWITCH_BUTTONS["Y"]
+                            if current_buttons & SWITCH_BUTTONS["B"]: new_btns |= SWITCH_BUTTONS["A"]
+                            if current_buttons & SWITCH_BUTTONS["Y"]: new_btns |= SWITCH_BUTTONS["B"]
+                        else:
+                            if current_buttons & SWITCH_BUTTONS["A"]: new_btns |= SWITCH_BUTTONS["B"]
+                            if current_buttons & SWITCH_BUTTONS["X"]: new_btns |= SWITCH_BUTTONS["A"]
+                            if current_buttons & SWITCH_BUTTONS["B"]: new_btns |= SWITCH_BUTTONS["Y"]
+                            if current_buttons & SWITCH_BUTTONS["Y"]: new_btns |= SWITCH_BUTTONS["X"]
+
+                        if current_buttons & SWITCH_BUTTONS["SL_R"]: new_btns |= SWITCH_BUTTONS["ZL"]
+                        if current_buttons & SWITCH_BUTTONS["SR_R"]: new_btns |= SWITCH_BUTTONS["ZR"]
+                        if current_buttons & SWITCH_BUTTONS["PLUS"]: new_btns |= SWITCH_BUTTONS["PLUS"]
+                        if current_buttons & SWITCH_BUTTONS["R_STK"]: new_btns |= SWITCH_BUTTONS["L_STK"]
+                        current_buttons = new_btns
+                
+                current_buttons |= custom_btns
+
+            inputData.gyro_rstick_overlay = gyro_rstick_overlay
+                    
+            if len(self.controllers) == 2:
+                buttonsConfig = CONFIG.dual_joycons_config
+                if controller.is_joycon_left(): self.previous_buttons_left = current_buttons
+                else: self.previous_buttons_right = current_buttons
+                buttons = self.previous_buttons_left | self.previous_buttons_right
+            else:
+                buttons = current_buttons
+                if controller.is_joycon_left(): buttonsConfig = CONFIG.single_joycon_l_config
+                elif controller.is_joycon_right(): buttonsConfig = CONFIG.single_joycon_r_config
+                else: buttonsConfig = CONFIG.procon_config
+                
+            if is_merged and getattr(CONFIG, "djg_enabled", False):
+                pass
+
+
+            if getattr(CONFIG, "gyro_passthrough_mode", "Default") == "Cemuhook":
+                import cemuhook_udp
+                from discoverer import VIRTUAL_CONTROLLERS
+                
+                if self.mode == "Switch1":
+                    send_cemuhook = True
+                elif len(self.controllers) == 1:
+                    send_cemuhook = True
+                else:
+                    send_cemuhook = False
+                    if self._is_djg_none_merge():
+                        left_on = bool(getattr(self, 'djg_left_active', True))
+                        right_on = bool(getattr(self, 'djg_right_active', True))
+                        send_cemuhook = (
+                            (right_on and controller.is_joycon_right()) or
+                            (left_on and not right_on and controller.is_joycon_left())
+                        )
+                    elif getattr(CONFIG, "djg_enabled", False):
+                        dom_side = getattr(CONFIG, "djg_dominant_side", "Right")
+                        if controller.is_joycon_left() and dom_side == "Left":
+                            send_cemuhook = True
+                        elif controller.is_joycon_right() and dom_side == "Right":
+                            send_cemuhook = True
+                    else:
+                        if controller.is_joycon_left() and self.active_gyro_side == "Left":
+                            send_cemuhook = True
+                        elif controller.is_joycon_right() and self.active_gyro_side == "Right":
+                            send_cemuhook = True
+                
+                if send_cemuhook:
+                        model = 3 if (controller.is_joycon_left() or controller.is_joycon_right()) else 2
+                        addr_str = (controller.device.address or "").replace(':', '').replace('-', '').upper()
+                        try:
+                            mac_bytes = bytes.fromhex(addr_str)
+                            if len(mac_bytes) != 6:
+                                raise ValueError("not a 6-byte MAC")
+                        except (ValueError, AttributeError):
+                            # device.address is a placeholder — try controller_info.mac_address
+                            # (real BLE MAC set from firmware connected event for ESP32 path)
+                            info_mac = (getattr(controller.controller_info, 'mac_address', None) or "")
+                            info_str = info_mac.replace(':', '').replace('-', '').upper()
+                            try:
+                                mac_bytes = bytes.fromhex(info_str)
+                                if len(mac_bytes) != 6:
+                                    raise ValueError()
+                            except (ValueError, AttributeError):
+                                import hashlib
+                                mac_bytes = hashlib.sha1(
+                                    (controller.device.address or "esp32").encode()
+                                ).digest()[:6]
+                        
+                        hold_mode = getattr(self, "hold_mode", "Vertical")
+                        
+                        # 1. 統一為標準的 V mode 物理軸向
+                        # 根據實測，Joy-Con 2 (左/右) 與 Pro Controller 的原始 IMU 座標系完全一致
+                        # 皆需要反轉三軸的重力向量 (X, Y, Z)，才能在 Yuzu 等模擬器中得到正確的旋轉方向與重力向量
+                        if self._is_djg_none_merge():
+                            source_gyro, source_accel = self._direct_merged_motion(inputData)
+                        else:
+                            source_gyro, source_accel = inputData.gyroscope, inputData.accelerometer
+                        base_gyro = (source_gyro[0], -source_gyro[1], -source_gyro[2])
+                        base_accel = (-source_accel[0], -source_accel[1], -source_accel[2])
+
+                        # 2. 如果使用者選擇水平握持 (H mode)，套用對應的 90 度旋轉
+                        if hold_mode == "Horizontal" and not controller.is_pro_controller():
+                            if controller.is_joycon_right():
+                                # 右手把：水平時 SL/SR 朝上，相當於順時針旋轉 90 度
+                                emu_gyro = (-base_gyro[1], base_gyro[0], base_gyro[2])
+                                emu_accel = (-base_accel[1], base_accel[0], base_accel[2])
+                            else:
+                                # 左手把：水平時 SL/SR 朝上，相當於逆時針旋轉 90 度
+                                emu_gyro = (base_gyro[1], -base_gyro[0], base_gyro[2])
+                                emu_accel = (base_accel[1], -base_accel[0], base_accel[2])
+                        else:
+                            # 垂直握持 (V mode)
+                            emu_gyro = base_gyro
+                            emu_accel = base_accel
+
+                        # 3. 將物理軸向轉換為 DS4 軸向 (Cemuhook 要求標準 DS4 軸向)
+                        # DS4 軸向定義為 Pitch (X), Yaw (Z), -Roll (Y)
+                        ds4_gyro = (emu_gyro[0], emu_gyro[2], -emu_gyro[1])
+                        ds4_accel = (emu_accel[0], emu_accel[2], -emu_accel[1])
+
+                        cemuhook_udp.cemuhook_server.report_controller_data(
+                            model, mac_bytes, 4, inputData, ds4_accel, ds4_gyro)
+                
+                # Zero out gyro/accel so the virtual controller driver gets no gyro
+                inputData.gyroscope = (0.0, 0.0, 0.0)
+                inputData.accelerometer = (0.0, 0.0, 0.0)
+
+            # Hand off to the submit thread rather than calling into the virtual pad
+            # driver here: this runs on the Bleak notification thread, and a blocking
+            # driver call would delay the next input report for every controller.
+            self._publish_input_submit(inputData, buttons, controller, buttonsConfig)
+
+            # Record raw buttons for shared click logic in next report
+            controller._last_raw_buttons = current_buttons
+            return True
+
+        def wrapped_callback(inputData: ControllerInputData, controller: Controller):
+            # A native driver submit may hold state_lock indefinitely. Serializing
+            # the entire physical report behind it stalls subsequent BLE/IR reports.
+            return input_report_callback(inputData, controller)
+
+        controller.set_input_report_callback(wrapped_callback)
+        controller.gyro_fusion_callback = self.gyro_fusion_callback
+        await self._activate_system_bt_merged_pair()
+
+
+    def _build_switch1_report(self, inputData: ControllerInputData, buttons: int, controller, device_type: str):
+        state = bytearray(50)
+        state[0] = 0x30
+        
+        if device_type == "L":
+            state[2] = 0x9E
+        elif device_type == "R":
+            state[2] = 0x8E
+        else: # Pro
+            state[2] = 0x8E
+        
+        hold_mode = getattr(self, 'hold_mode', 'Vertical')
+        # Scale Gyro to match the exact sensitivity expected by emulators for a Switch 1 Joy-Con.
+        # Switch 2 controllers natively output ~16.384 LSB/dps (0.061 dps/LSB).
+        # Switch 1 controllers natively output ~14.37 LSB/dps (0.0695 dps/LSB).
+        # To make a Switch 2 controller perfectly emulate a Switch 1 controller, we must 
+        # multiply its raw output by (14.37 / 16.384) = ~0.877 so that emulators calculate 
+        # the exact physical rotation when they divide by their assumed 14.37 LSB/dps.
+        # (0.0535 / 0.061) is mathematically ~0.87704, which perfectly achieves this.
+        jc_gyro_scale = 0.0535 / 0.061
+        jc_yaw_mult = 1.0
+
+        if device_type != "Pro":
+            import time as _t
+            if getattr(controller, '_sw1_gyro_accum', None) is None:
+                controller._sw1_gyro_accum = [0.0, 0.0, 0.0]
+                controller._sw1_gyro_accum_time = 0.0
+                controller._sw1_gyro_emit_frames = [(0.0, 0.0, 0.0)] * 3
+                controller._sw1_gyro_last_t = _t.perf_counter()
+                controller._sw1_gyro_last_timer = inputData.raw_data[1] if (len(inputData.raw_data) > 1 and inputData.raw_data[0] == 0x30) else None
+
+            if len(inputData.raw_data) > 1 and inputData.raw_data[0] == 0x30:
+                current_timer = inputData.raw_data[1]
+                if controller._sw1_gyro_last_timer is not None:
+                    timer_diff = (current_timer - controller._sw1_gyro_last_timer) & 0xFF
+                    _dt = timer_diff * 0.005
+                else:
+                    _dt = 0.0075 # fallback
+                controller._sw1_gyro_last_timer = current_timer
+                _integration_dt = _dt
+            else:
+                _now = _t.perf_counter()
+                raw_dt = _now - controller._sw1_gyro_last_t
+                controller._sw1_gyro_last_t = _now
+
+                # Prevent absurd _dt on lag spikes
+                if raw_dt > 0.1: raw_dt = 0.015
+                if raw_dt < 0.0: raw_dt = 0.001
+                
+                # Auto-adapt to System BLE polling rate (e.g. 66Hz or 20Hz) while eliminating jitter.
+                # Uses an Exponential Moving Average (EMA) to find the steady "per-tick" cadence.
+                if getattr(controller, '_sw1_gyro_smoothed_dt', None) is None:
+                    controller._sw1_gyro_smoothed_dt = raw_dt
+                else:
+                    controller._sw1_gyro_smoothed_dt = 0.85 * controller._sw1_gyro_smoothed_dt + 0.15 * raw_dt
+                
+                _dt = raw_dt
+                if getattr(controller, 'is_esp32s3_bridge', False):
+                    # ESP32 bridge (USB Serial) has inherently low jitter and handles its own cadence perfectly.
+                    # Bypassing the EMA filter ensures ESP32 maintains its exact original precise behavior.
+                    _integration_dt = raw_dt
+                else:
+                    _integration_dt = controller._sw1_gyro_smoothed_dt
+
+            # Accumulate true physical rotation.
+            # _dt controls the 15ms emission pacing, _integration_dt handles smooth magnitude integration.
+            controller._sw1_gyro_accum_time += _integration_dt
+            _acc = controller._sw1_gyro_accum
+            _rg = inputData.gyroscope
+            
+            for _i in range(3):
+                _acc[_i] += _rg[_i] * _integration_dt
+
+            _NATIVE_DT = 0.015
+            should_emit = False
+            
+            # Strictly push only when 15ms has elapsed physically.
+            # A real Joy-Con sends a 0x30 report with 3 IMU frames every 15ms (66.7Hz).
+            if controller._sw1_gyro_accum_time >= _NATIVE_DT:
+                _avg = tuple(_acc[_i] / 0.015 for _i in range(3))
+                controller._sw1_gyro_emit_frames = [_avg, _avg, _avg]
+                
+                controller._sw1_gyro_accum = [0.0, 0.0, 0.0]
+                controller._sw1_gyro_accum_time -= 0.015
+                if controller._sw1_gyro_accum_time > 0.015:
+                    controller._sw1_gyro_accum_time = 0.0 # Safety cap
+                should_emit = True
+                
+            gsrc3 = controller._sw1_gyro_emit_frames
+        else:
+            if getattr(controller, '_sw1_gyro_history', None) is None:
+                controller._sw1_gyro_history = [(0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)]
+            controller._sw1_gyro_history.pop(0)
+            controller._sw1_gyro_history.append(inputData.gyroscope)
+            gsrc3 = list(controller._sw1_gyro_history)
+            should_emit = True
+
+        lx, ly, rx, ry = 0.0, 0.0, 0.0, 0.0
+        gx, gy, gz, ax, ay, az = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        custom_stick_route = getattr(inputData, 'custom_joystick_mapping', None)
+
+        if device_type == "L":
+            if custom_stick_route:
+                lx = inputData.left_stick[0]
+                ly = inputData.left_stick[1]
+                rx = inputData.right_stick[0]
+                ry = inputData.right_stick[1]
+            else:
+                lx = inputData.left_stick[0]
+                ly = inputData.left_stick[1]
+            
+            if hold_mode == "Vertical":
+                _gmap = lambda g: (g[1] * jc_gyro_scale, -g[0] * jc_gyro_scale, g[2] * jc_gyro_scale * jc_yaw_mult)
+                ax, ay, az =  inputData.accelerometer[1],  -inputData.accelerometer[0],  inputData.accelerometer[2]
+            else: # Horizontal
+                _gmap = lambda g: (g[0] * jc_gyro_scale, g[1] * jc_gyro_scale, g[2] * jc_gyro_scale * jc_yaw_mult)
+                ax, ay, az =  inputData.accelerometer[0], inputData.accelerometer[1],  inputData.accelerometer[2]
+
+            if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:
+                lx = getattr(controller, '_shared_steer_value', getattr(controller, '_own_steer_value', 0.0))
+
+        elif device_type == "R": # device_type == "R"
+            if custom_stick_route:
+                lx = inputData.left_stick[0]
+                ly = inputData.left_stick[1]
+                rx = inputData.right_stick[0]
+                ry = inputData.right_stick[1]
+            else:
+                rx = inputData.right_stick[0]
+                ry = inputData.right_stick[1]
+            
+            if hold_mode == "Vertical":
+                _gmap = lambda g: (g[1] * jc_gyro_scale, g[0] * jc_gyro_scale, -g[2] * jc_gyro_scale * jc_yaw_mult)
+                ax, ay, az =  inputData.accelerometer[1], inputData.accelerometer[0], -inputData.accelerometer[2]
+            else: # Horizontal
+                _gmap = lambda g: (-g[0] * jc_gyro_scale, g[1] * jc_gyro_scale, -g[2] * jc_gyro_scale * jc_yaw_mult)
+                ax, ay, az = -inputData.accelerometer[0], inputData.accelerometer[1], -inputData.accelerometer[2]
+
+            if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:
+                rx = getattr(controller, '_shared_steer_value', getattr(controller, '_own_steer_value', 0.0))
+        else: # Pro
+            lx = inputData.left_stick[0]
+            ly = inputData.left_stick[1]
+            rx = inputData.right_stick[0]
+            ry = inputData.right_stick[1]
+
+            _gmap = lambda g: (g[1], -g[0], g[2])
+            ax, ay, az = inputData.accelerometer[1], -inputData.accelerometer[0], inputData.accelerometer[2]
+
+            if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:
+                lx = getattr(controller, '_shared_steer_value', getattr(controller, '_own_steer_value', 0.0))
+
+        rx, ry = self._add_gyro_rstick_overlay(rx, ry, inputData)
+
+        def float_to_12bit(val):
+            return int(max(0, min(4095, round((val + 1.0) * 2047.5))))
+
+        lx_12 = float_to_12bit(lx)
+        ly_12 = float_to_12bit(ly)
+        rx_12 = float_to_12bit(rx)
+        ry_12 = float_to_12bit(ry)
+        
+        controller._sw1_should_emit = should_emit
+
+        # Left stick packed (bytes 6-8)
+        state[6] = lx_12 & 0xff
+        state[7] = ((lx_12 >> 8) & 0x0f) | ((ly_12 & 0x0f) << 4)
+        state[8] = (ly_12 >> 4) & 0xff
+
+        # Right stick packed (bytes 9-11)
+        state[9] = rx_12 & 0xff
+        state[10] = ((rx_12 >> 8) & 0x0f) | ((ry_12 & 0x0f) << 4)
+        state[11] = (ry_12 >> 4) & 0xff
+
+        b3, b4, b5 = 0, 0, 0
+        
+        if device_type == "L":
+            if buttons & SWITCH_BUTTONS["DOWN"]:  b5 |= 0x01
+            if buttons & SWITCH_BUTTONS["UP"]:    b5 |= 0x02
+            if buttons & SWITCH_BUTTONS["RIGHT"]: b5 |= 0x04
+            if buttons & SWITCH_BUTTONS["LEFT"]:  b5 |= 0x08
+            if buttons & SWITCH_BUTTONS.get("SR_L", 0): b5 |= 0x10
+            if buttons & SWITCH_BUTTONS.get("SL_L", 0): b5 |= 0x20
+            if buttons & SWITCH_BUTTONS["L"]:     b5 |= 0x40
+            if buttons & SWITCH_BUTTONS["ZL"]:    b5 |= 0x80
+            
+            if buttons & SWITCH_BUTTONS["MINUS"]: b4 |= 0x01
+            if buttons & SWITCH_BUTTONS["L_STK"]: b4 |= 0x08
+            if buttons & SWITCH_BUTTONS.get("CAPT", 0): b4 |= 0x20
+        elif device_type == "R": # Right Joycon
+            if buttons & SWITCH_BUTTONS["Y"]:     b3 |= 0x01
+            if buttons & SWITCH_BUTTONS["X"]:     b3 |= 0x02
+            if buttons & SWITCH_BUTTONS["B"]:     b3 |= 0x04
+            if buttons & SWITCH_BUTTONS["A"]:     b3 |= 0x08
+            if buttons & SWITCH_BUTTONS.get("SR_R", 0): b3 |= 0x10
+            if buttons & SWITCH_BUTTONS.get("SL_R", 0): b3 |= 0x20
+            if buttons & SWITCH_BUTTONS["R"]:     b3 |= 0x40
+            if buttons & SWITCH_BUTTONS["ZR"]:    b3 |= 0x80
+            
+            if buttons & SWITCH_BUTTONS["PLUS"]:  b4 |= 0x02
+            if buttons & SWITCH_BUTTONS["R_STK"]: b4 |= 0x04
+            if buttons & SWITCH_BUTTONS.get("HOME", 0): b4 |= 0x10
+        else: # Pro Controller
+            if buttons & SWITCH_BUTTONS["Y"]:     b3 |= 0x01
+            if buttons & SWITCH_BUTTONS["X"]:     b3 |= 0x02
+            if buttons & SWITCH_BUTTONS["B"]:     b3 |= 0x04
+            if buttons & SWITCH_BUTTONS["A"]:     b3 |= 0x08
+            if buttons & SWITCH_BUTTONS.get("SR_R", 0): b3 |= 0x10
+            if buttons & SWITCH_BUTTONS.get("SL_R", 0): b3 |= 0x20
+            if buttons & SWITCH_BUTTONS["R"]:     b3 |= 0x40
+            if buttons & SWITCH_BUTTONS["ZR"]:    b3 |= 0x80
+            
+            if buttons & SWITCH_BUTTONS["MINUS"]: b4 |= 0x01
+            if buttons & SWITCH_BUTTONS["PLUS"]:  b4 |= 0x02
+            if buttons & SWITCH_BUTTONS["R_STK"]: b4 |= 0x04
+            if buttons & SWITCH_BUTTONS["L_STK"]: b4 |= 0x08
+            if buttons & SWITCH_BUTTONS.get("HOME", 0): b4 |= 0x10
+            if buttons & SWITCH_BUTTONS.get("CAPT", 0): b4 |= 0x20
+            
+            if buttons & SWITCH_BUTTONS["DOWN"]:  b5 |= 0x01
+            if buttons & SWITCH_BUTTONS["UP"]:    b5 |= 0x02
+            if buttons & SWITCH_BUTTONS["RIGHT"]: b5 |= 0x04
+            if buttons & SWITCH_BUTTONS["LEFT"]:  b5 |= 0x08
+            if buttons & SWITCH_BUTTONS.get("SR_L", 0): b5 |= 0x10
+            if buttons & SWITCH_BUTTONS.get("SL_L", 0): b5 |= 0x20
+            if buttons & SWITCH_BUTTONS["L"]:     b5 |= 0x40
+            if buttons & SWITCH_BUTTONS["ZL"]:    b5 |= 0x80
+            
+        state[3] = b3
+        state[4] = b4
+        state[5] = b5
+
+        def clamp_i16(v): return max(-32768, min(32767, int(round(v))))
+
+        # The 3 IMU frames carry 3 sub-samples 5 ms apart (oldest=frame 0 .. newest=frame 2),
+        # per imu_sensor_notes.md, so the host gets 5 ms-precision motion instead of one 15 ms
+        # burst.  Same accel in all three (accel is a direct reading, not integrated); gyro is
+        # the per-third sub-sample mapped through _gmap.  (For Pro / experiment, gsrc3 holds 3
+        # identical samples → 3 identical frames, i.e. the original behaviour.)
+        for _fi, _off in enumerate((13, 25, 37)):
+            _g = _gmap(gsrc3[_fi])
+            state[_off:_off + 12] = struct.pack('<6h',
+                clamp_i16(ax), clamp_i16(ay), clamp_i16(az),
+                clamp_i16(_g[0]), clamp_i16(_g[1]), clamp_i16(_g[2]))
+
+        controller._sw1_should_emit = should_emit
+        return state
+
+    def update_as_switch1_joycon_l(self, inputData: ControllerInputData, buttons: int, controller):
+        if self.driver_type == "USBIP":
+            if hasattr(self, 'usbip_server_l') and self.usbip_server_l:
+                state = self._build_switch1_report(inputData, buttons, controller, device_type="L")
+                if getattr(controller, '_sw1_should_emit', True):
+                    self.usbip_server_l.update_state(state)
+                return True
+        return False
+
+    def update_as_switch1_joycon_r(self, inputData: ControllerInputData, buttons: int, controller):
+        if self.driver_type == "USBIP":
+            if hasattr(self, 'usbip_server_r') and self.usbip_server_r:
+                state = self._build_switch1_report(inputData, buttons, controller, device_type="R")
+                if getattr(controller, '_sw1_should_emit', True):
+                    self.usbip_server_r.update_state(state)
+                return True
+        return False
+
+    def update_as_switch1_pro(self, inputData: ControllerInputData, buttons: int, controller):
+        if self.driver_type == "USBIP":
+            if hasattr(self, 'usbip_server_pro') and self.usbip_server_pro:
+                state = self._build_switch1_report(inputData, buttons, controller, device_type="Pro")
+                self.usbip_server_pro.update_state(state)
+                return True
+        return False
+
+    def _add_gyro_rstick_overlay(self, rx, ry, inputData):
+        gx, gy = getattr(inputData, "gyro_rstick_overlay", (0.0, 0.0))
+        if gx == 0.0 and gy == 0.0:
+            return self._clamp_stick_pair((rx, ry))
+        rx += gx
+        ry += gy
+        return self._clamp_stick_magnitude((rx, ry))
+
+    def update_as_ps4(self, inputData: ControllerInputData, buttons: int, controller: Controller):
+
+        with self.state_lock:
+            if self.vg_controller is None:
+                return False
+            self._update_as_ps4_locked(inputData, buttons, controller)
+            if getattr(self, 'driver_type', '') != "ViGEmBus":
+                return self.vg_controller.update() is not False
+            return True
+
+    def _update_as_ps4_locked(self, inputData: ControllerInputData, buttons: int, controller: Controller):
+        driver_type = self.driver_type
+        if driver_type == "ViGEmBus":
+            report = self.report_ex.Report
+            
+            ds4_buttons = 0
+            if buttons & SWITCH_BUTTONS["Y"]: ds4_buttons |= DS4_BUTTONS.DS4_BUTTON_SQUARE
+            if buttons & SWITCH_BUTTONS["X"]: ds4_buttons |= DS4_BUTTONS.DS4_BUTTON_TRIANGLE
+            if buttons & SWITCH_BUTTONS["B"]: ds4_buttons |= DS4_BUTTONS.DS4_BUTTON_CROSS
+            if buttons & SWITCH_BUTTONS["A"]: ds4_buttons |= DS4_BUTTONS.DS4_BUTTON_CIRCLE
+            if buttons & SWITCH_BUTTONS["L"]: ds4_buttons |= DS4_BUTTONS.DS4_BUTTON_SHOULDER_LEFT
+            if buttons & SWITCH_BUTTONS["R"]: ds4_buttons |= DS4_BUTTONS.DS4_BUTTON_SHOULDER_RIGHT
+            if buttons & SWITCH_BUTTONS["ZL"]: ds4_buttons |= DS4_BUTTONS.DS4_BUTTON_TRIGGER_LEFT
+            if buttons & SWITCH_BUTTONS["ZR"]: ds4_buttons |= DS4_BUTTONS.DS4_BUTTON_TRIGGER_RIGHT
+            if buttons & SWITCH_BUTTONS["MINUS"]: ds4_buttons |= DS4_BUTTONS.DS4_BUTTON_SHARE
+            if buttons & SWITCH_BUTTONS["PLUS"]: ds4_buttons |= DS4_BUTTONS.DS4_BUTTON_OPTIONS
+            if buttons & SWITCH_BUTTONS["L_STK"]: ds4_buttons |= DS4_BUTTONS.DS4_BUTTON_THUMB_LEFT
+            if buttons & SWITCH_BUTTONS["R_STK"]: ds4_buttons |= DS4_BUTTONS.DS4_BUTTON_THUMB_RIGHT
+
+            up = bool(buttons & SWITCH_BUTTONS["UP"])
+            down = bool(buttons & SWITCH_BUTTONS["DOWN"])
+            left = bool(buttons & SWITCH_BUTTONS["LEFT"])
+            right = bool(buttons & SWITCH_BUTTONS["RIGHT"])
+            report.wButtons = ds4_buttons | get_ds4_dpad(up, down, left, right)
+
+            report.bSpecial = 0
+            if buttons & SWITCH_BUTTONS.get("HOME", 0): 
+                report.bSpecial |= DS4_SPECIAL_BUTTONS.DS4_SPECIAL_BUTTON_PS
+
+            capt = bool(buttons & SWITCH_BUTTONS.get("CAPT", 0))
+            tpad_l = bool(buttons & SWITCH_BUTTONS.get("PS_L_Touch", 0))
+            tpad_r = bool(buttons & SWITCH_BUTTONS.get("PS_R_Touch", 0))
+            tpad_c = bool(buttons & SWITCH_BUTTONS.get("PS_C_Click", 0))
+
+            is_touching = capt or tpad_l or tpad_r or tpad_c
+
+            if is_touching:
+                report.bSpecial |= DS4_SPECIAL_BUTTONS.DS4_SPECIAL_BUTTON_TOUCHPAD
+                if not getattr(self, 'was_touching', False):
+                    self.touch_tracking_id = (getattr(self, 'touch_tracking_id', 0) + 1) & 0x7F
+                report.sCurrentTouch.bIsUpTrackingNum1 = self.touch_tracking_id
+
+                if tpad_l:
+                    report.sCurrentTouch.bTouchData1[0] = 0xE0
+                    report.sCurrentTouch.bTouchData1[1] = 0x71
+                    report.sCurrentTouch.bTouchData1[2] = 0x1D
+                elif tpad_r:
+                    report.sCurrentTouch.bTouchData1[0] = 0xA0
+                    report.sCurrentTouch.bTouchData1[1] = 0x75
+                    report.sCurrentTouch.bTouchData1[2] = 0x1D
+                else:
+                    report.sCurrentTouch.bTouchData1[0] = 0xC0
+                    report.sCurrentTouch.bTouchData1[1] = 0x73
+                    report.sCurrentTouch.bTouchData1[2] = 0x1D
+            else:
+                report.sCurrentTouch.bIsUpTrackingNum1 = 0x80 | getattr(self, 'touch_tracking_id', 0)
+
+            self.was_touching = is_touching
+            report.sCurrentTouch.bIsUpTrackingNum2 = 0x80
+
+            if getattr(controller.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
+                report.bTriggerL = inputData.left_trigger
+                report.bTriggerR = inputData.right_trigger
+            else:
+                report.bTriggerL = 255 if (buttons & SWITCH_BUTTONS["ZL"]) else 0
+                report.bTriggerR = 255 if (buttons & SWITCH_BUTTONS["ZR"]) else 0
+
+            # Joystick routing
+            if not hasattr(self, 'last_lx'):
+                self.last_lx = 128; self.last_ly = 128
+                self.last_rx = 128; self.last_ry = 128
+                self.last_gx = 0; self.last_gy = 0; self.last_gz = 0
+                self.last_ax = 0; self.last_ay = 0; self.last_az = 0
+
+            custom_stick_route = getattr(inputData, 'custom_joystick_mapping', None)
+            if len(self.controllers) == 1:
+                if not controller.is_joycon() and (
+                    self._joystick_mapping_mode("l_joystick", controller) in ("L Joystick", "R Joystick") or
+                    self._joystick_mapping_mode("r_joystick", controller) in ("L Joystick", "R Joystick")
+                ):
+                    mixed_left, mixed_right = self._update_merged_stick_mix(inputData, controller)
+                    self.last_lx = float_to_byte(mixed_left[0])
+                    self.last_ly = float_to_byte(-mixed_left[1])
+                    self.last_rx = float_to_byte(mixed_right[0])
+                    self.last_ry = float_to_byte(-mixed_right[1])
+                elif custom_stick_route:
+                    self.last_lx = float_to_byte(inputData.left_stick[0])
+                    self.last_ly = float_to_byte(-inputData.left_stick[1])
+                    self.last_rx = float_to_byte(inputData.right_stick[0])
+                    self.last_ry = float_to_byte(-inputData.right_stick[1])
+                elif controller.is_joycon_right():
+                    if self.hold_mode == "Vertical":
+                        self.last_rx = int(max(0, min(255, round(inputData.right_stick[0] * 127.5 + 128))))
+                        self.last_ry = int(max(0, min(255, round(-inputData.right_stick[1] * 127.5 + 128))))
+                        self.last_lx = 128
+                        self.last_ly = 128
+                    else:
+                        self.last_lx = float_to_byte(inputData.right_stick[0])
+                        self.last_ly = float_to_byte(-inputData.right_stick[1])
+                        self.last_rx = 128
+                        self.last_ry = 128
+                else:
+                    self.last_lx = float_to_byte(inputData.left_stick[0])
+                    self.last_ly = float_to_byte(-inputData.left_stick[1])
+                    self.last_rx = float_to_byte(inputData.right_stick[0])
+                    self.last_ry = float_to_byte(-inputData.right_stick[1])
+
+                rx_float = (self.last_rx - 128) / 127.5
+                ry_float = -((self.last_ry - 128) / 127.5)
+                rx_float, ry_float = self._add_gyro_rstick_overlay(rx_float, ry_float, inputData)
+                self.last_rx = float_to_byte(rx_float)
+                self.last_ry = float_to_byte(-ry_float)
+                
+                if self.hold_mode == "Horizontal" and not controller.is_pro_controller():
+                    if controller.is_joycon_right():
+                        self.last_gx = inputData.gyroscope[1]
+                        self.last_gy = inputData.gyroscope[2]
+                        self.last_gz = -inputData.gyroscope[0]
+                        self.last_ax = -inputData.accelerometer[1]
+                        self.last_ay = inputData.accelerometer[2]
+                        self.last_az = inputData.accelerometer[0]
+                    else:
+                        self.last_gx = -inputData.gyroscope[1]
+                        self.last_gy = inputData.gyroscope[2]
+                        self.last_gz = inputData.gyroscope[0]
+                        self.last_ax = -inputData.accelerometer[1]
+                        self.last_ay = inputData.accelerometer[2]
+                        self.last_az = -inputData.accelerometer[0]
+                else:
+                    self.last_gx = inputData.gyroscope[0]
+                    self.last_gy = inputData.gyroscope[2]
+                    self.last_gz = -inputData.gyroscope[1]
+                    self.last_ax = inputData.accelerometer[0]
+                    self.last_ay = inputData.accelerometer[2]
+                    self.last_az = -inputData.accelerometer[1]
+            else:
+                mixed_left, mixed_right = self._update_merged_stick_mix(inputData, controller)
+                mixed_right = self._add_gyro_rstick_overlay(mixed_right[0], mixed_right[1], inputData)
+                self.last_lx = float_to_byte(mixed_left[0])
+                self.last_ly = float_to_byte(-mixed_left[1])
+                self.last_rx = float_to_byte(mixed_right[0])
+                self.last_ry = float_to_byte(-mixed_right[1])
+
+                if self._is_djg_none_merge():
+                    merged_g, merged_a = self._direct_merged_motion(inputData)
+                    self.last_gx = merged_g[0]
+                    self.last_gy = merged_g[2]
+                    self.last_gz = -merged_g[1]
+                    self.last_ax = merged_a[0]
+                    self.last_ay = merged_a[2]
+                    self.last_az = -merged_a[1]
+                else:
+                    is_passthrough_source = False
+                    if getattr(CONFIG, "djg_enabled", False):
+                        dom_side = getattr(CONFIG, "djg_dominant_side", "Right")
+                        if controller.is_joycon_left() and dom_side == "Left":
+                            is_passthrough_source = True
+                        elif controller.is_joycon_right() and dom_side == "Right":
+                            is_passthrough_source = True
+                    else:
+                        if controller.is_joycon_left() and self.active_gyro_side == "Left":
+                            is_passthrough_source = True
+                        elif controller.is_joycon_right() and self.active_gyro_side == "Right":
+                            is_passthrough_source = True
+
+                    if is_passthrough_source:
+                        self.last_gx = inputData.gyroscope[0]
+                        self.last_gy = inputData.gyroscope[2]
+                        self.last_gz = -inputData.gyroscope[1]
+                        self.last_ax = inputData.accelerometer[0]
+                        self.last_ay = inputData.accelerometer[2]
+                        self.last_az = -inputData.accelerometer[1]
+
+            if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:
+                steer = getattr(controller, '_shared_steer_value', controller._own_steer_value if hasattr(controller, '_own_steer_value') else 0.0)
+                self.last_lx = int(max(0, min(255, round(steer * 127.5 + 128))))
+
+            report.bThumbLX = self.last_lx
+            report.bThumbLY = self.last_ly
+            report.bThumbRX = self.last_rx
+            report.bThumbRY = self.last_ry
+
+            def clamp_short(val): return max(-32768, min(32767, int(val)))
+            # Native Switch 2 LSBs mean nothing to a DS4 host; convert to the scale
+            # the calibration report advertises.  Without this the accelerometer
+            # reads half its true magnitude and the Pro's gyro 0.872x.
+            a_scale, g_scale = ds_motion_scale(controller, getattr(self, 'driver_type', ''), "PS4")
+            report.wGyroX = clamp_short(self.last_gx * g_scale)
+            report.wGyroY = clamp_short(self.last_gy * g_scale)
+            report.wGyroZ = clamp_short(self.last_gz * g_scale)
+            report.wAccelX = clamp_short(self.last_ax * a_scale)
+            report.wAccelY = clamp_short(self.last_ay * a_scale)
+            report.wAccelZ = clamp_short(self.last_az * a_scale)
+        else:
+            self._update_ps_controller_locked(inputData, buttons, controller, self.vg_controller.report, mode="PS4")
+
+    def update_as_ps5(self, inputData: ControllerInputData, buttons: int, controller: Controller):
+        submitted = False
+        lock_started_ns = time.perf_counter_ns()
+        with self.state_lock:
+            lock_acquired_ns = time.perf_counter_ns()
+            if self.vg_controller is None:
+                submitted = False
+                mapped_ns = lock_acquired_ns
+                native_done_ns = mapped_ns
+            else:
+                self._update_as_ps5_locked(inputData, buttons, controller)
+                mapped_ns = time.perf_counter_ns()
+                if (self.driver_type == "WinUHid" and power_saving.is_full()
+                        and hasattr(self.vg_controller, "update_latest")):
+                    result = self.vg_controller.update_latest()
+                else:
+                    result = self.vg_controller.update()
+                native_done_ns = time.perf_counter_ns()
+                submitted = result is not False
+        self._last_submit_phase_ms = (
+            (lock_acquired_ns - lock_started_ns) / 1_000_000.0,
+            (mapped_ns - lock_acquired_ns) / 1_000_000.0,
+            (native_done_ns - mapped_ns) / 1_000_000.0,
+        )
+        return submitted
+
+    def _update_as_ps5_locked(self, inputData: ControllerInputData, buttons: int, controller: Controller):
+        self._update_ps_controller_locked(inputData, buttons, controller, self.vg_controller.report, mode="PS5")
+
+    def _update_ps_controller_locked(self, inputData: ControllerInputData, buttons: int, controller: Controller, report, mode: str):
+        # 1. Map buttons
+        report.ButtonSquare = 1 if (buttons & SWITCH_BUTTONS["Y"]) else 0
+        report.ButtonTriangle = 1 if (buttons & SWITCH_BUTTONS["X"]) else 0
+        report.ButtonCross = 1 if (buttons & SWITCH_BUTTONS["B"]) else 0
+        report.ButtonCircle = 1 if (buttons & SWITCH_BUTTONS["A"]) else 0
+        
+        report.ButtonL1 = 1 if (buttons & SWITCH_BUTTONS["L"]) else 0
+        report.ButtonR1 = 1 if (buttons & SWITCH_BUTTONS["R"]) else 0
+        report.ButtonL2 = 1 if (buttons & SWITCH_BUTTONS["ZL"]) else 0
+        report.ButtonR2 = 1 if (buttons & SWITCH_BUTTONS["ZR"]) else 0
+        
+        report.ButtonShare = 1 if (buttons & SWITCH_BUTTONS["MINUS"]) else 0
+        report.ButtonOptions = 1 if (buttons & SWITCH_BUTTONS["PLUS"]) else 0
+        report.ButtonL3 = 1 if (buttons & SWITCH_BUTTONS["L_STK"]) else 0
+        report.ButtonR3 = 1 if (buttons & SWITCH_BUTTONS["R_STK"]) else 0
+        
+        report.ButtonHome = 1 if (buttons & SWITCH_BUTTONS.get("HOME", 0)) else 0
+
+        if mode == "PS5":
+            report.ButtonMute = 1 if (buttons & 0x10000000) else 0
+
+        # 2. D-pad (Hat)
+        up = bool(buttons & SWITCH_BUTTONS["UP"])
+        down = bool(buttons & SWITCH_BUTTONS["DOWN"])
+        left = bool(buttons & SWITCH_BUTTONS["LEFT"])
+        right = bool(buttons & SWITCH_BUTTONS["RIGHT"])
+        
+        hat_x = -1 if left else (1 if right else 0)
+        hat_y = -1 if up else (1 if down else 0)
+        
+        hat_val = 8
+        if hat_x == 0 and hat_y == -1: hat_val = 0
+        elif hat_x == 1 and hat_y == -1: hat_val = 1
+        elif hat_x == 1 and hat_y == 0: hat_val = 2
+        elif hat_x == 1 and hat_y == 1: hat_val = 3
+        elif hat_x == 0 and hat_y == 1: hat_val = 4
+        elif hat_x == -1 and hat_y == 1: hat_val = 5
+        elif hat_x == -1 and hat_y == 0: hat_val = 6
+        elif hat_x == -1 and hat_y == -1: hat_val = 7
+        
+        report.Hat = hat_val
+
+        # 3. Touchpad
+        capt = bool(buttons & SWITCH_BUTTONS.get("CAPT", 0))
+        tpad_l = bool(buttons & SWITCH_BUTTONS.get("PS_L_Touch", 0))
+        tpad_r = bool(buttons & SWITCH_BUTTONS.get("PS_R_Touch", 0))
+        tpad_c = bool(buttons & SWITCH_BUTTONS.get("PS_C_Click", 0))
+
+        # Set mechanical click button (CAPT and PS_C_Click trigger click)
+        report.ButtonTouchpad = 1 if (capt or tpad_c) else 0
+
+        # Touch Point 0: Left touch or Center touch (CAPT)
+        touch_0_down = tpad_l or capt
+        touch_0_x = 100 if tpad_l else 960
+        touch_0_y = 512
+
+        # Touch Point 1: Right touch
+        touch_1_down = tpad_r
+        touch_1_x = 1800
+        touch_1_y = 512
+
+        is_new_touch_0 = touch_0_down and not self.was_touching_0
+        is_new_touch_1 = touch_1_down and not self.was_touching_1
+
+        # Set touch states for both points
+        self._set_touch_state(report, 0, touch_0_down, touch_0_x, touch_0_y, mode, is_new_touch_0)
+        self._set_touch_state(report, 1, touch_1_down, touch_1_x, touch_1_y, mode, is_new_touch_1)
+
+        self.was_touching_0 = touch_0_down
+        self.was_touching_1 = touch_1_down
+        self.was_touching = touch_0_down or touch_1_down
+
+        # 4. Triggers
+        if getattr(controller.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
+            report.LeftTrigger = inputData.left_trigger
+            report.RightTrigger = inputData.right_trigger
+            is_zl_pressed = inputData.left_trigger > 10
+            is_zr_pressed = inputData.right_trigger > 10
+        else:
+            report.LeftTrigger = 255 if (buttons & SWITCH_BUTTONS["ZL"]) else 0
+            report.RightTrigger = 255 if (buttons & SWITCH_BUTTONS["ZR"]) else 0
+            is_zl_pressed = bool(buttons & SWITCH_BUTTONS["ZL"])
+            is_zr_pressed = bool(buttons & SWITCH_BUTTONS["ZR"])
+            
+        import time
+        now = time.perf_counter()
+        
+        if is_zl_pressed and not getattr(self, 'prev_zl_pressed', False):
+            if getattr(self, 'last_lt_mode', 0) not in (0x00, 0x05):
+                self.trigger_l_punch_end = now + 0.150
+        self.prev_zl_pressed = is_zl_pressed
+
+        if is_zr_pressed and not getattr(self, 'prev_zr_pressed', False):
+            if getattr(self, 'last_rt_mode', 0) not in (0x00, 0x05):
+                self.trigger_r_punch_end = now + 0.150
+        self.prev_zr_pressed = is_zr_pressed
+        
+        if mode == "PS5":
+            report.SequenceNumber = (report.SequenceNumber + 1) & 0xFF
+        # 5. Joysticks Routing
+        if not hasattr(self, 'last_lx'):
+            self.last_lx = 128; self.last_ly = 128
+            self.last_rx = 128; self.last_ry = 128
+            self.last_gx = 0; self.last_gy = 0; self.last_gz = 0
+            self.last_ax = 0; self.last_ay = 0; self.last_az = 0
+
+        custom_stick_route = getattr(inputData, 'custom_joystick_mapping', None)
+        if len(self.controllers) == 1:
+            if not controller.is_joycon() and (
+                self._joystick_mapping_mode("l_joystick", controller) in ("L Joystick", "R Joystick") or
+                self._joystick_mapping_mode("r_joystick", controller) in ("L Joystick", "R Joystick")
+            ):
+                mixed_left, mixed_right = self._update_merged_stick_mix(inputData, controller)
+                self.last_lx = float_to_byte(mixed_left[0])
+                self.last_ly = float_to_byte(-mixed_left[1])
+                self.last_rx = float_to_byte(mixed_right[0])
+                self.last_ry = float_to_byte(-mixed_right[1])
+            elif custom_stick_route:
+                self.last_lx = float_to_byte(inputData.left_stick[0])
+                self.last_ly = float_to_byte(-inputData.left_stick[1])
+                self.last_rx = float_to_byte(inputData.right_stick[0])
+                self.last_ry = float_to_byte(-inputData.right_stick[1])
+            elif controller.is_joycon_right():
+                if self.hold_mode == "Vertical":
+                    self.last_rx = int(max(0, min(255, round(inputData.right_stick[0] * 127.5 + 128))))
+                    self.last_ry = int(max(0, min(255, round(-inputData.right_stick[1] * 127.5 + 128))))
+                    self.last_lx = 128
+                    self.last_ly = 128
+                else:
+                    self.last_lx = float_to_byte(inputData.right_stick[0])
+                    self.last_ly = float_to_byte(-inputData.right_stick[1])
+                    self.last_rx = 128
+                    self.last_ry = 128
+            else:
+                self.last_lx = float_to_byte(inputData.left_stick[0])
+                self.last_ly = float_to_byte(-inputData.left_stick[1])
+                self.last_rx = float_to_byte(inputData.right_stick[0])
+                self.last_ry = float_to_byte(-inputData.right_stick[1])
+
+            rx_float = (self.last_rx - 128) / 127.5
+            ry_float = -((self.last_ry - 128) / 127.5)
+            rx_float, ry_float = self._add_gyro_rstick_overlay(rx_float, ry_float, inputData)
+            self.last_rx = float_to_byte(rx_float)
+            self.last_ry = float_to_byte(-ry_float)
+            
+            if self.hold_mode == "Horizontal" and not controller.is_pro_controller():
+                if controller.is_joycon_right():
+                    self.last_gx = inputData.gyroscope[1]
+                    self.last_gy = inputData.gyroscope[2]
+                    self.last_gz = -inputData.gyroscope[0]
+                    self.last_ax = -inputData.accelerometer[1]
+                    self.last_ay = inputData.accelerometer[2]
+                    self.last_az = inputData.accelerometer[0]
+                else:
+                    self.last_gx = -inputData.gyroscope[1]
+                    self.last_gy = inputData.gyroscope[2]
+                    self.last_gz = inputData.gyroscope[0]
+                    self.last_ax = -inputData.accelerometer[1]
+                    self.last_ay = inputData.accelerometer[2]
+                    self.last_az = -inputData.accelerometer[0]
+            else:
+                self.last_gx = inputData.gyroscope[0]
+                self.last_gy = inputData.gyroscope[2]
+                self.last_gz = -inputData.gyroscope[1]
+                self.last_ax = inputData.accelerometer[0]
+                self.last_ay = inputData.accelerometer[2]
+                self.last_az = -inputData.accelerometer[1]
+        else:
+            mixed_left, mixed_right = self._update_merged_stick_mix(inputData, controller)
+            mixed_right = self._add_gyro_rstick_overlay(mixed_right[0], mixed_right[1], inputData)
+            self.last_lx = float_to_byte(mixed_left[0])
+            self.last_ly = float_to_byte(-mixed_left[1])
+            self.last_rx = float_to_byte(mixed_right[0])
+            self.last_ry = float_to_byte(-mixed_right[1])
+
+            if self._is_djg_none_merge():
+                merged_g, merged_a = self._direct_merged_motion(inputData)
+                self.last_gx = merged_g[0]
+                self.last_gy = merged_g[2]
+                self.last_gz = -merged_g[1]
+                self.last_ax = merged_a[0]
+                self.last_ay = merged_a[2]
+                self.last_az = -merged_a[1]
+            else:
+                is_passthrough_source = False
+                if getattr(CONFIG, "djg_enabled", False):
+                    dom_side = getattr(CONFIG, "djg_dominant_side", "Right")
+                    if controller.is_joycon_left() and dom_side == "Left":
+                        is_passthrough_source = True
+                    elif controller.is_joycon_right() and dom_side == "Right":
+                        is_passthrough_source = True
+                else:
+                    if controller.is_joycon_left() and self.active_gyro_side == "Left":
+                        is_passthrough_source = True
+                    elif controller.is_joycon_right() and self.active_gyro_side == "Right":
+                        is_passthrough_source = True
+                        
+                if is_passthrough_source:
+                    self.last_gx = inputData.gyroscope[0]
+                    self.last_gy = inputData.gyroscope[2]
+                    self.last_gz = -inputData.gyroscope[1]
+                    self.last_ax = inputData.accelerometer[0]
+                    self.last_ay = inputData.accelerometer[2]
+                    self.last_az = -inputData.accelerometer[1]
+
+        if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:
+            steer = getattr(controller, '_shared_steer_value', controller._own_steer_value if hasattr(controller, '_own_steer_value') else 0.0)
+            self.last_lx = int(max(0, min(255, round(steer * 127.5 + 128))))
+
+        report.LeftStickX = self.last_lx
+        report.LeftStickY = self.last_ly
+        report.RightStickX = self.last_rx
+        report.RightStickY = self.last_ry
+
+        # 6. Gyro/Accel signed short assignments, converted from native Switch 2 LSBs
+        # into the scale the DualSense calibration report advertises.
+        def clamp_short(val): return max(-32768, min(32767, int(val)))
+        a_scale, g_scale = ds_motion_scale(controller, getattr(self, 'driver_type', ''), mode)
+        if mode == "PS5":
+            if getattr(self, 'driver_type', '') == "WinUHid":
+                report.GyroX = clamp_short(self.last_gx * g_scale)
+                report.GyroY = clamp_short(self.last_gy * g_scale)
+                report.GyroZ = clamp_short(self.last_gz * g_scale)
+                report.AccelX = clamp_short(self.last_ax * a_scale)
+                report.AccelY = clamp_short(self.last_ay * a_scale)
+                report.AccelZ = clamp_short(self.last_az * a_scale)
+            else:
+                report.AngularVelocityX = clamp_short(self.last_gx * g_scale)   # Pitch <- gyroscope[0]
+                report.AngularVelocityY = clamp_short(self.last_gz * g_scale)   # Yaw   <- -gyroscope[1] (was Roll, swap with gz)
+                report.AngularVelocityZ = clamp_short(self.last_gy * g_scale)   # Roll  <- gyroscope[2]  (was Yaw, swap with gy)
+                report.AccelerometerX = clamp_short(self.last_ax * a_scale)
+                report.AccelerometerY = clamp_short(self.last_ay * a_scale)
+                report.AccelerometerZ = clamp_short(self.last_az * a_scale)
+            # SensorTimestamp: DualSense reports in ~0.33us ticks (3MHz clock).
+            # EA and strict DualSense games validate this increments monotonically.
+            # At 250Hz USB polling, each frame = 4000us = ~12000 ticks.
+            now_us = int(time.perf_counter() * 1_000_000) & 0xFFFFFFFF
+            report.SensorTimestamp = (now_us * 3) & 0xFFFFFFFF  # Convert us -> 3MHz ticks
+            # UNK_COUNTER: IMU packet sequence counter, increments each frame.
+            report.UNK_COUNTER = (getattr(report, 'UNK_COUNTER', 0) + 1) & 0xFFFFFFFF
+        else:
+            report.GyroX = clamp_short(self.last_gx * g_scale)
+            report.GyroY = clamp_short(self.last_gy * g_scale)
+            report.GyroZ = clamp_short(self.last_gz * g_scale)
+            report.AccelX = clamp_short(self.last_ax * a_scale)
+            report.AccelY = clamp_short(self.last_ay * a_scale)
+            report.AccelZ = clamp_short(self.last_az * a_scale)
+
+    def _set_touch_state(self, report, touch_index, touch_down, touch_x, touch_y, mode, is_new_touch=False):
+        if mode == "PS4":
+            tp = report.TouchReports[0].TouchPoints[touch_index]
+            if touch_down:
+                if is_new_touch:
+                    tp.ContactSeq = (tp.ContactSeq + 1) & 0x7F
+                else:
+                    tp.ContactSeq = tp.ContactSeq & 0x7F
+            else:
+                tp.ContactSeq = tp.ContactSeq | 0x80
+                
+            tp.XLowPart = touch_x & 0xFF
+            tp.XHighPart = (touch_x >> 8) & 0xF
+            tp.YLowPart = touch_y & 0xF
+            tp.YHighPart = (touch_y >> 4) & 0xFF
+            report.TouchReportCount = 1
+            report.TouchReports[0].Timestamp = (report.TouchReports[0].Timestamp + 1) & 0xFF
+        else:  # PS5
+            tp = report.TouchReport.TouchPoints[touch_index]
+            if touch_down:
+                if is_new_touch:
+                    tp.ContactSeq = (tp.ContactSeq + 1) & 0x7F
+                else:
+                    tp.ContactSeq = tp.ContactSeq & 0x7F
+            else:
+                tp.ContactSeq = tp.ContactSeq | 0x80
+                
+            tp.XLowPart = touch_x & 0xFF
+            tp.XHighPart = (touch_x >> 8) & 0xF
+            tp.YLowPart = touch_y & 0xF
+            tp.YHighPart = (touch_y >> 4) & 0xFF
+            report.TouchReport.Timestamp = (report.TouchReport.Timestamp + 1) & 0xFF
+
+    def update_as_xbox(self, inputData: ControllerInputData, buttons: int, controller: Controller, buttonsConfig: ButtonConfig):
+        with self.state_lock:
+            if self.vg_controller is None:
+                return False
+            # Phase 1: Button Mapping (Respects GUI layout setting)
+            xb_btns = 0
+            
+            if getattr(controller.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
+                if buttons & SWITCH_BUTTONS["Y"]: xb_btns |= XB_BUTTONS["Y"]
+                if buttons & SWITCH_BUTTONS["X"]: xb_btns |= XB_BUTTONS["X"]
+                if buttons & SWITCH_BUTTONS["B"]: xb_btns |= XB_BUTTONS["B"]
+                if buttons & SWITCH_BUTTONS["A"]: xb_btns |= XB_BUTTONS["A"]
+            elif CONFIG.abxy_mode == "Xbox":
+                # When UI says "Xbox", we want "Switch layout" (positional match)
+                if buttons & SWITCH_BUTTONS["Y"]: xb_btns |= XB_BUTTONS["X"]
+                if buttons & SWITCH_BUTTONS["X"]: xb_btns |= XB_BUTTONS["Y"]
+                if buttons & SWITCH_BUTTONS["B"]: xb_btns |= XB_BUTTONS["A"]
+                if buttons & SWITCH_BUTTONS["A"]: xb_btns |= XB_BUTTONS["B"]
+            else: # Switch layout in UI
+                # When UI says "Switch", we want "Xbox layout" (name match)
+                if buttons & SWITCH_BUTTONS["Y"]: xb_btns |= XB_BUTTONS["X"]
+                if buttons & SWITCH_BUTTONS["X"]: xb_btns |= XB_BUTTONS["Y"]
+                if buttons & SWITCH_BUTTONS["B"]: xb_btns |= XB_BUTTONS["A"]
+                if buttons & SWITCH_BUTTONS["A"]: xb_btns |= XB_BUTTONS["B"]
+                    
+            if buttons & SWITCH_BUTTONS["L"]: xb_btns |= XB_BUTTONS["LB"]
+            if buttons & SWITCH_BUTTONS["R"]: xb_btns |= XB_BUTTONS["RB"]
+            
+            if getattr(controller.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
+                lt = inputData.left_trigger
+                rt = inputData.right_trigger
+            else:
+                lt = 255 if (buttons & SWITCH_BUTTONS["ZL"]) else 0
+                rt = 255 if (buttons & SWITCH_BUTTONS["ZR"]) else 0
+            
+            if buttons & SWITCH_BUTTONS["MINUS"]: xb_btns |= XB_BUTTONS["BACK"]
+            if buttons & SWITCH_BUTTONS["PLUS"]: xb_btns |= XB_BUTTONS["START"]
+            if buttons & SWITCH_BUTTONS["L_STK"]: xb_btns |= XB_BUTTONS["L_STK"]
+            if buttons & SWITCH_BUTTONS["R_STK"]: xb_btns |= XB_BUTTONS["R_STK"]
+            
+            if buttons & SWITCH_BUTTONS["UP"]: xb_btns |= XB_BUTTONS["UP"]
+            if buttons & SWITCH_BUTTONS["DOWN"]: xb_btns |= XB_BUTTONS["DOWN"]
+            if buttons & SWITCH_BUTTONS["LEFT"]: xb_btns |= XB_BUTTONS["LEFT"]
+            if buttons & SWITCH_BUTTONS["RIGHT"]: xb_btns |= XB_BUTTONS["RIGHT"]
+            
+            if buttons & SWITCH_BUTTONS.get("HOME", 0): xb_btns |= XB_BUTTONS["GUIDE"]
+            if buttons & SWITCH_BUTTONS.get("CAPT", 0): xb_btns |= XB_BUTTONS["BACK"]
+ 
+            # Phase 2: Stick Routing (Mirrored from PS4 logic)
+            if not hasattr(self, 'last_xb_lx'):
+                self.last_xb_lx = 0.0; self.last_xb_ly = 0.0
+                self.last_xb_rx = 0.0; self.last_xb_ry = 0.0
+ 
+            custom_stick_route = getattr(inputData, 'custom_joystick_mapping', None)
+            if len(self.controllers) == 1:
+                if not controller.is_joycon() and (
+                    self._joystick_mapping_mode("l_joystick", controller) in ("L Joystick", "R Joystick") or
+                    self._joystick_mapping_mode("r_joystick", controller) in ("L Joystick", "R Joystick")
+                ):
+                    mixed_left, mixed_right = self._update_merged_stick_mix(inputData, controller)
+                    self.last_xb_lx = mixed_left[0]
+                    self.last_xb_ly = mixed_left[1]
+                    self.last_xb_rx = mixed_right[0]
+                    self.last_xb_ry = mixed_right[1]
+                elif custom_stick_route:
+                    self.last_xb_lx = inputData.left_stick[0]
+                    self.last_xb_ly = inputData.left_stick[1]
+                    self.last_xb_rx = inputData.right_stick[0]
+                    self.last_xb_ry = inputData.right_stick[1]
+                elif controller.is_joycon_right():
+                    if self.hold_mode == "Vertical":
+                        self.last_xb_rx = inputData.right_stick[0]
+                        self.last_xb_ry = inputData.right_stick[1]
+                        self.last_xb_lx = 0.0; self.last_xb_ly = 0.0
+                    else:
+                        self.last_xb_lx = inputData.right_stick[0]
+                        self.last_xb_ly = inputData.right_stick[1]
+                        self.last_xb_rx = 0.0
+                        self.last_xb_ry = 0.0
+                else:
+                    self.last_xb_lx = inputData.left_stick[0]
+                    self.last_xb_ly = inputData.left_stick[1]
+                    self.last_xb_rx = inputData.right_stick[0]
+                    self.last_xb_ry = inputData.right_stick[1]
+            else:
+                mixed_left, mixed_right = self._update_merged_stick_mix(inputData, controller)
+                self.last_xb_lx = mixed_left[0]
+                self.last_xb_ly = mixed_left[1]
+                self.last_xb_rx = mixed_right[0]
+                self.last_xb_ry = mixed_right[1]
+
+            rx_float, ry_float = self._add_gyro_rstick_overlay(self.last_xb_rx, self.last_xb_ry, inputData)
+            self.last_xb_rx = rx_float
+            self.last_xb_ry = ry_float
+
+            if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:
+                self.last_xb_lx = getattr(controller, '_shared_steer_value', controller._own_steer_value if hasattr(controller, '_own_steer_value') else 0.0)
+                self.last_xb_lx = max(-1.0, min(1.0, self.last_xb_lx))
+
+            # Phase 3: Final Reporting
+            if self.driver_type == "ViGEmBus":
+                self.vg_controller.report.wButtons = xb_btns
+                self.vg_controller.left_trigger(lt)
+                self.vg_controller.right_trigger(rt)
+                self.vg_controller.left_joystick_float(self.last_xb_lx, self.last_xb_ly)
+                self.vg_controller.right_joystick_float(self.last_xb_rx, self.last_xb_ry)
+                self.vg_controller.update()
+            else:
+                self.vg_controller.set_buttons(xb_btns)
+                self.vg_controller.left_trigger(lt)
+                self.vg_controller.right_trigger(rt)
+                self.vg_controller.left_joystick_float(self.last_xb_lx, -self.last_xb_ly)
+                self.vg_controller.right_joystick_float(self.last_xb_rx, -self.last_xb_ry)
+                self.vg_controller.update()
+            return True
+
+    def is_single(self): 
+        return len(self.controllers) == 1
+    
+    def is_single_joycon_right(self):
+        return self.is_single() and len(self.controllers) > 0 and self.controllers[0].is_joycon_right()
+
+    def is_single_joycon_left(self):
+        return self.is_single() and len(self.controllers) > 0 and self.controllers[0].is_joycon_left()
+        
+    async def update_leds(self):
+        for c in self.controllers: await c.set_leds(self.player_number)
+        
+    def add_controller(self, c): 
+        self.controllers.append(c)
+        self._refresh_controller_cache()
+    
+    def start_calibration(self):
+        for c in self.controllers:
+            if hasattr(c, 'start_calibration'):
+                c.start_calibration()
+
+    def start_mag_calibration(self):
+        for c in self.controllers:
+            if hasattr(c, 'start_mag_calibration'):
+                c.start_mag_calibration()
+
+    def stop_mag_calibration(self):
+        for c in self.controllers:
+            if hasattr(c, 'stop_mag_calibration'):
+                c.stop_mag_calibration()
+
+    def cancel_calibration(self):
+        for c in self.controllers:
+            if hasattr(c, 'cancel_calibration'):
+                c.cancel_calibration()
+
+    def cancel_mag_calibration(self):
+        for c in self.controllers:
+            if hasattr(c, 'cancel_mag_calibration'):
+                c.cancel_mag_calibration()
+
+    def _1000hz_loop(self):
+        import time
+        last_time = time.perf_counter()
+        timer_acquired = False
+        while self.running:
+            if power_saving.is_full():
+                if timer_acquired:
+                    timer_resolution.release()
+                    timer_acquired = False
+                self._update_wake.wait()
+                self._update_wake.clear()
+                last_time = time.perf_counter()
+                continue
+            driver_type = getattr(self, 'driver_type', None)
+            mode = getattr(self, 'mode', None)
+            
+            if driver_type != "ViGEmBus" or mode != "PS4":
+                if timer_acquired:
+                    timer_resolution.release()
+                    timer_acquired = False
+                self._update_wake.wait()
+                self._update_wake.clear()
+                last_time = time.perf_counter()
+                continue
+
+            if not timer_acquired:
+                timer_acquired = timer_resolution.acquire()
+
+            now = time.perf_counter()
+            dt = now - last_time
+            if dt < 0.001:
+                time.sleep(0)
+                continue
+                
+            last_time = now
+            if dt > 0.05: dt = 0.015
+            
+            with self.state_lock:
+                if not hasattr(self, 'vg_controller') or self.vg_controller is None:
+                    continue
+                
+                driver_type = self.driver_type
+                if driver_type == "ViGEmBus" and self.mode == "PS4":
+                    ticks = int(dt * 187500)
+                    self.ds4_timestamp = (getattr(self, 'ds4_timestamp', 0) + ticks) & 0xFFFF
+                    
+                    self.report_ex.Report.wTimestamp = self.ds4_timestamp
+                    self.report_ex.Report.bTouchPacketsN = 1
+                    self.touch_packet_counter = (getattr(self, 'touch_packet_counter', 0) + 1) & 0xFF
+                    self.report_ex.Report.sCurrentTouch.bPacketCounter = self.touch_packet_counter
+            
+                    try:
+                        import vgamepad.win.vigem_client as vcli
+                        vcli.vigem_target_ds4_update_ex_ptr.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(DS4_REPORT_EX)]
+                        busp = self.vg_controller.vbus.get_busp()
+                        devicep = self.vg_controller._devicep
+                        vcli.vigem_target_ds4_update_ex_ptr(busp, devicep, ctypes.byref(self.report_ex))
+                    except Exception as e:
+                        logger.error(f"Failed to update DS4 ex via ViGEmBus: {e}")
+                        self.vg_controller.update()
+        
+        if timer_acquired:
+            timer_resolution.release()
+        logger.info(f"Player {self.player_number}: Update loop thread finished.")
+
+    def reset_inputs(self):
+        """Reset all virtual inputs to neutral/released state."""
+        with self.state_lock:
+            if self.vg_controller is not None:
+                driver_type = self.driver_type
+                if self.mode == "Switch2":
+                    self.last_s2_lx = 0.0; self.last_s2_ly = 0.0
+                    self.last_s2_rx = 0.0; self.last_s2_ry = 0.0
+                    self.last_s2_gx = 0; self.last_s2_gy = 0; self.last_s2_gz = 0
+                    self.last_s2_ax = 0; self.last_s2_ay = 0; self.last_s2_az = 0
+
+                    state = bytearray(64)
+                    state[0] = 0x05
+                    state[2] = 0x12
+
+                    state[11] = 2048 & 0xff
+                    state[12] = ((2048 >> 8) & 0x0f) | ((2048 & 0x0f) << 4)
+                    state[13] = (2048 >> 4) & 0xff
+                    state[14] = 2048 & 0xff
+                    state[15] = ((2048 >> 8) & 0x0f) | ((2048 & 0x0f) << 4)
+                    state[16] = (2048 >> 4) & 0xff
+
+                    state[42] = 0x01
+                    if hasattr(self, 'usbip_server') and self.usbip_server:
+                        self.usbip_server.update_state(state)
+                elif self.mode == "Switch1":
+                    self.last_s2_lx = 0.0; self.last_s2_ly = 0.0; self.last_s2_rx = 0.0; self.last_s2_ry = 0.0
+                    self.last_s2_gx = 0; self.last_s2_gy = 0; self.last_s2_gz = 0
+                    self.last_s2_ax = 0; self.last_s2_ay = 0; self.last_s2_az = 0
+                    
+                    state_l = bytearray(50)
+                    state_l[0] = 0x30
+                    state_l[2] = 0x9E
+                    state_l[6] = 0x00
+                    state_l[7] = 0x08
+                    state_l[8] = 0x80
+                    state_l[9] = 0x00
+                    state_l[10] = 0x08
+                    state_l[11] = 0x80
+                    
+                    state_r = bytearray(50)
+                    state_r[0] = 0x30
+                    state_r[2] = 0x8E
+                    state_r[6] = 0x00
+                    state_r[7] = 0x08
+                    state_r[8] = 0x80
+                    state_r[9] = 0x00
+                    state_r[10] = 0x08
+                    state_r[11] = 0x80
+                    
+                    state_pro = bytearray(50)
+                    state_pro[0] = 0x30
+                    state_pro[2] = 0x8E
+                    state_pro[6] = 0x00
+                    state_pro[7] = 0x08
+                    state_pro[8] = 0x80
+                    state_pro[9] = 0x00
+                    state_pro[10] = 0x08
+                    state_pro[11] = 0x80
+                    
+                    if hasattr(self, 'usbip_server_l') and self.usbip_server_l:
+                        self.usbip_server_l.update_state(state_l)
+                    if hasattr(self, 'usbip_server_r') and self.usbip_server_r:
+                        self.usbip_server_r.update_state(state_r)
+                    if hasattr(self, 'usbip_server_pro') and self.usbip_server_pro:
+                        self.usbip_server_pro.update_state(state_pro)
+                else:  # ViGEmBus
+                    if self.mode == "Xbox360":
+                        self.vg_controller.reset()
+                    else:  # PS4
+                        self.report_ex = DS4_REPORT_EX()
+                        self.report_ex.Report.bThumbLX = 128
+                        self.report_ex.Report.bThumbLY = 128
+                        self.report_ex.Report.bThumbRX = 128
+                        self.report_ex.Report.bThumbRY = 128
+                        self.report_ex.Report.bBatteryLvl = 0xAF
+                        self.report_ex.Report.bBatteryLvlSpecial = 0x08
+
+            logger.info(f"Player {self.player_number}: Virtual inputs reset to neutral.")
+            self.previous_buttons_left = 0x00000000
+            self.previous_buttons_right = 0x00000000
+            self.was_touching = False
+            self.was_touching_0 = False
+            self.was_touching_1 = False
+            self.touch_start_time = 0.0
+
+    def force_close(self, usbip_already_detached=False):
+        """Synchronously and forcefully close the virtual device handle."""
+        self.running = False
+        self._update_wake.set()
+        
+        # 1. Wait for the high-frequency update thread to terminate
+        if hasattr(self, 'update_thread') and self.update_thread.is_alive():
+            logger.info(f"Player {self.player_number}: Waiting for update thread to exit...")
+            self.update_thread.join(timeout=0.5)
+            
+        # 2. Use the lock to ensure no other thread (like BLE callback) is using the gamepad
+        with self.state_lock:
+            if hasattr(self, 'vg_controller') and self.vg_controller is not None:
+                logger.info(f"Player {self.player_number}: Forcefully destroying virtual device handle.")
+                self.cleanup_vg_controller(detach_usbip=not usbip_already_detached)
+                
+        server_port = self.server_port
+        if not usbip_already_detached:
+            detach_usbip_device(server_port)
+        if hasattr(self, 'usbip_server') and self.usbip_server:
+            try:
+                self.usbip_server.stop()
+            except Exception:
+                pass
+            self.usbip_server = None
+        
+        # 3. Force garbage collection to ensure driver resources are released NOW
+        gc.collect()
+
+    async def disconnect(self, timeout=3.0, is_suspending=False):
+        async with self._disconnect_lock:
+            if not getattr(self, 'running', False) and self.vg_controller is None and not self.controllers:
+                return
+                
+            await self._deactivate_system_bt_merged_pair()
+            self.running = False
+            self._update_wake.set()
+            import time
+            current_time = time.strftime("%H:%M:%S")
+            logger.info(f"[{current_time}] Player {self.player_number}: Starting disconnect sequence (is_suspending={is_suspending})...")
+            
+            # Wait for the update thread to finish before proceeding with handle cleanup
+            if hasattr(self, 'update_thread') and self.update_thread.is_alive():
+                logger.info(f"Player {self.player_number}: Waiting for update thread to exit...")
+                # Increase timeout to ensure thread actually finishes before handle is cleared
+                self.update_thread.join(timeout=0.5)
+                if self.update_thread.is_alive():
+                    logger.warning(f"Player {self.player_number}: Update thread did not exit in time!")
+            
+            if not self.controllers and self.vg_controller is None:
+                return
+ 
+            logger.info(f"Player {self.player_number}: Cleaning up virtual device and physical connections...")
+            
+            with self.state_lock:
+                self.cleanup_vg_controller()
+                    
+            server_port = self.server_port
+            detach_usbip_device(server_port)
+            if hasattr(self, 'usbip_server') and self.usbip_server:
+                try:
+                    self.usbip_server.stop()
+                except Exception:
+                    pass
+                self.usbip_server = None
+            
+            # Explicitly trigger GC to help release driver handles
+            gc.collect()
+                
+            disconnect_tasks = []
+            for c in list(self.controllers):
+                if hasattr(c, 'client') and c.client and c.client.is_connected:
+                    logger.info(f"Player {self.player_number}: Disconnecting Bluetooth for {c.device.address}")
+                    disconnect_tasks.append(asyncio.create_task(c.disconnect()))
+                    
+            if disconnect_tasks:
+                try:
+                    # Await the actual disconnection tasks
+                    await asyncio.wait_for(asyncio.gather(*disconnect_tasks), timeout=timeout)
+                except asyncio.TimeoutError:
+                    logger.warning(f"Player {self.player_number}: Bluetooth disconnection timed out")
+                except Exception as e:
+                    logger.error(f"Player {self.player_number}: Error during Bluetooth disconnection: {e}")
+                
+            for c in list(self.controllers):
+                if self.on_disconnected_callback:
+                    try:
+                        await self.on_disconnected_callback(c)
+                    except Exception:
+                        pass
+                    
+            self.controllers.clear()
+            self._refresh_controller_cache()
+            logger.info(f"Player {self.player_number}: Cleanup complete.")
+
+    def trigger_disconnect(self):
+        if self.loop and self.loop.is_running():
+            asyncio.run_coroutine_threadsafe(self.disconnect(), self.loop)
+        else:
+            logger.error("Event loop not found or not running.")
+
+    async def remove_controller(self, controller: Controller, clear_mac_port: bool = False) -> bool:
+        if controller not in self.controllers:
+            return False
+
+        if self._is_system_bt_merged_joycon_pair():
+            await self._deactivate_system_bt_merged_pair()
+            
+        self.controllers.remove(controller)
+        # Drop the back-reference set in init_added_controller(). Any rumble-scheduler tick
+        # that outlives this call then returns immediately at its `vc is None` guard instead
+        # of doing full work against a virtual device that is being torn down.
+        if getattr(controller, "virtual_controller", None) is self:
+            controller.virtual_controller = None
+        self._refresh_controller_cache()
+        if clear_mac_port:
+                # Only clear the MAC->port mapping when the physical controller truly disconnects
+                # (BLE disconnect), NOT during merge/split operations where it stays connected.
+                mac = controller.device.address
+                global MAC_TO_PORT
+                if mac in MAC_TO_PORT:
+                    MAC_TO_PORT.pop(mac, None)
+            
+        if len(self.controllers) == 0:
+            # Mark as not running immediately so any pending setup_virtual_device call
+            # (e.g. from a split that was followed immediately by a merge) sees the flag
+            # and skips creating a zombie USBIP server.
+            self.running = False
+            self._update_wake.set()
+            with self.state_lock:
+                self.cleanup_vg_controller()
+                
+            if self.mode == "Switch2":
+                server_port = self.server_port
+                detach_usbip_device(server_port)
+                if hasattr(self, 'usbip_server') and self.usbip_server:
+                    try:
+                        self.usbip_server.stop()
+                    except Exception:
+                        pass
+                    self.usbip_server = None
+                
+            return True 
+        else:
+            if self.mode == "Switch1":
+                if controller.is_joycon_left() and getattr(self, 'usbip_server_l', None) is not None:
+                    if hasattr(self, 'server_port_l') and self.server_port_l:
+                        try:
+                            detach_usbip_device(self.server_port_l)
+                        except Exception:
+                            pass
+                    try:
+                        self.usbip_server_l.stop()
+                    except Exception:
+                        pass
+                    self.usbip_server_l = None
+                elif controller.is_joycon_right() and getattr(self, 'usbip_server_r', None) is not None:
+                    if hasattr(self, 'server_port_r') and self.server_port_r:
+                        try:
+                            detach_usbip_device(self.server_port_r)
+                        except Exception:
+                            pass
+                    try:
+                        self.usbip_server_r.stop()
+                    except Exception:
+                        pass
+                    self.usbip_server_r = None
+                elif controller.is_pro_controller() and getattr(self, 'usbip_server_pro', None) is not None:
+                    if hasattr(self, 'server_port_pro') and self.server_port_pro:
+                        try:
+                            detach_usbip_device(self.server_port_pro)
+                        except Exception:
+                            pass
+                    try:
+                        self.usbip_server_pro.stop()
+                    except Exception:
+                        pass
+                    self.usbip_server_pro = None
+
+            if getattr(self, 'running', True):
+                try:
+                    await self.init_added_controller(self.controllers[0])
+                except Exception as e:
+                    logger.error(f"Failed to re-init remaining controller after split/remove: {e}")
+            return False
+
+    def _dualsense_rumble_callback(self, out_data, side="Pro"):
+        delay = getattr(CONFIG, "rumble_delay_ms", 0)
+        if delay > 0:
+            import threading
+            threading.Timer(delay / 1000.0, self._run_rumble_callback, args=(self._dualsense_rumble_callback_internal, out_data, side)).start()
+        else:
+            self._run_rumble_callback(self._dualsense_rumble_callback_internal, out_data, side)
+
+    def _dualsense_rumble_callback_internal(self, out_data, side="Pro"):
+        if len(out_data) < 2:
+            return
+
+        if out_data[0] == 0x01:
+            # Basic Rumble Report (ID=0x01)
+            # Format: [0x01, RightMotor, LeftMotor]
+            if len(out_data) >= 3:
+                right_motor_weak = out_data[1]
+                left_motor_strong = out_data[2]
+                
+                lf_amp = int((left_motor_strong / 255.0) * 1000)
+                hf_amp = int((right_motor_weak / 255.0) * 1000)
+
+                dt = time.perf_counter() - self.cycle_start_time
+                slot_size = RUMBLE_WRITE_INTERVAL / 3.0
+                slot = int(dt / slot_size) if slot_size > 0 else 0
+                if slot < 0: slot = 0
+                elif slot > 2: slot = 2
+                
+                import math
+                with self.vibration_lock:
+                    lf_freq = 0x0e1
+                    hf_freq = 0x1e1
+
+                    # Apply to Left (Xbox Rumble limit is 1000, so we use 700 + 300*tanh)
+                    raw_lf_l = self.frame_vibrations_l[slot].lf_amp + lf_amp
+                    raw_hf_l = self.frame_vibrations_l[slot].hf_amp + hf_amp
+                    if raw_lf_l <= 700: self.frame_vibrations_l[slot].lf_amp = int(raw_lf_l)
+                    else: self.frame_vibrations_l[slot].lf_amp = int(700 + 300 * math.tanh((raw_lf_l - 700) / 300))
+                    if raw_hf_l <= 700: self.frame_vibrations_l[slot].hf_amp = int(raw_hf_l)
+                    else: self.frame_vibrations_l[slot].hf_amp = int(700 + 300 * math.tanh((raw_hf_l - 700) / 300))
+                    self.frame_vibrations_l[slot].lf_freq = lf_freq
+                    self.frame_vibrations_l[slot].hf_freq = hf_freq
+                    
+                    # Apply to Right
+                    raw_lf_r = self.frame_vibrations_r[slot].lf_amp + lf_amp
+                    raw_hf_r = self.frame_vibrations_r[slot].hf_amp + hf_amp
+                    if raw_lf_r <= 700: self.frame_vibrations_r[slot].lf_amp = int(raw_lf_r)
+                    else: self.frame_vibrations_r[slot].lf_amp = int(700 + 300 * math.tanh((raw_lf_r - 700) / 300))
+                    if raw_hf_r <= 700: self.frame_vibrations_r[slot].hf_amp = int(raw_hf_r)
+                    else: self.frame_vibrations_r[slot].hf_amp = int(700 + 300 * math.tanh((raw_hf_r - 700) / 300))
+                    self.frame_vibrations_r[slot].lf_freq = lf_freq
+                    self.frame_vibrations_r[slot].hf_freq = hf_freq
+
+                    self.latest_vibration_l.lf_amp = lf_amp
+                    self.latest_vibration_l.hf_amp = hf_amp
+                    self.latest_vibration_l.lf_freq = lf_freq
+                    self.latest_vibration_l.hf_freq = hf_freq
+                    
+                    self.latest_vibration_r.lf_amp = lf_amp
+                    self.latest_vibration_r.hf_amp = hf_amp
+                    self.latest_vibration_r.lf_freq = lf_freq
+                    self.latest_vibration_r.hf_freq = hf_freq
+                    
+                    self.last_rumble_active_time = time.perf_counter()
+                    self.vibration_dirty_l = True
+                    self.vibration_dirty_r = True
+
+        elif out_data[0] == 0x11:
+            # Custom High-Fidelity Rumble Report (ID=0x11)
+            # Format: [0x11, RightIntensity, LeftIntensity]
+            if len(out_data) >= 3:
+                right_intensity = out_data[1] # Small motor (HF)
+                left_intensity = out_data[2]  # Large motor (LF)
+                
+                lf_amp = int(800 * left_intensity / 256)
+                hf_amp = int(800 * right_intensity / 256)
+
+                dt = time.perf_counter() - self.cycle_start_time
+                slot_size = RUMBLE_WRITE_INTERVAL / 3.0
+                slot = int(dt / slot_size) if slot_size > 0 else 0
+                if slot < 0: slot = 0
+                elif slot > 2: slot = 2
+                
+                import math
+                with self.vibration_lock:
+                    # WinUHid perfectly aligned frequencies
+                    lf_freq = 0x0e1
+                    hf_freq = 0x1e1
+                        
+                    # Apply to Left
+                    raw_lf_l = self.frame_vibrations_l[slot].lf_amp + lf_amp
+                    raw_hf_l = self.frame_vibrations_l[slot].hf_amp + hf_amp
+                    if raw_lf_l <= 560: self.frame_vibrations_l[slot].lf_amp = int(raw_lf_l)
+                    else: self.frame_vibrations_l[slot].lf_amp = int(560 + 240 * math.tanh((raw_lf_l - 560) / 240))
+                    if raw_hf_l <= 560: self.frame_vibrations_l[slot].hf_amp = int(raw_hf_l)
+                    else: self.frame_vibrations_l[slot].hf_amp = int(560 + 240 * math.tanh((raw_hf_l - 560) / 240))
+                    self.frame_vibrations_l[slot].lf_freq = lf_freq
+                    self.frame_vibrations_l[slot].hf_freq = hf_freq
+                    
+                    # Apply to Right
+                    raw_lf_r = self.frame_vibrations_r[slot].lf_amp + lf_amp
+                    raw_hf_r = self.frame_vibrations_r[slot].hf_amp + hf_amp
+                    if raw_lf_r <= 560: self.frame_vibrations_r[slot].lf_amp = int(raw_lf_r)
+                    else: self.frame_vibrations_r[slot].lf_amp = int(560 + 240 * math.tanh((raw_lf_r - 560) / 240))
+                    if raw_hf_r <= 560: self.frame_vibrations_r[slot].hf_amp = int(raw_hf_r)
+                    else: self.frame_vibrations_r[slot].hf_amp = int(560 + 240 * math.tanh((raw_hf_r - 560) / 240))
+                    self.frame_vibrations_r[slot].lf_freq = lf_freq
+                    self.frame_vibrations_r[slot].hf_freq = hf_freq
+
+                    self.latest_vibration_l.lf_amp = lf_amp
+                    self.latest_vibration_l.hf_amp = hf_amp
+                    self.latest_vibration_l.lf_freq = lf_freq
+                    self.latest_vibration_l.hf_freq = hf_freq
+                    
+                    self.latest_vibration_r.lf_amp = lf_amp
+                    self.latest_vibration_r.hf_amp = hf_amp
+                    self.latest_vibration_r.lf_freq = lf_freq
+                    self.latest_vibration_r.hf_freq = hf_freq
+                    
+                    self.last_rumble_active_time = time.perf_counter()
+                    self.vibration_dirty_l = True
+                    self.vibration_dirty_r = True
+            return
+                
+        elif out_data[0] == 0x02:
+            # Standard USB Rumble Report (Extended)
+            # Switch 2 processes vibration by slicing byte arrays directly instead of ctypes.
+            # Using direct indexing is much faster and prevents dropping packets in the high-frequency Audio Haptic / Rumble loop.
+            if len(out_data) >= 5:
+                # --- Rumble source arbitration (ported from y700-switch2-pro-bridge) ---
+                # The game signals its intent via the DualSense output-report valid_flag
+                # bits: enabling any compatible / rumble-emulation flag means it wants
+                # ordinary motor rumble; leaving them all off means it drives HD haptics
+                # through the audio endpoint (ch2/3).  We route exactly ONE source at a
+                # time (source arbitration, not byte-level mixing).  Adaptive-trigger FFB
+                # further below is independent of this and is always processed.
+                valid_flag0 = out_data[1] if len(out_data) > 1 else 0
+                valid_flag2 = out_data[39] if len(out_data) > 39 else 0
+                compat_v1 = (valid_flag0 & 0x01) != 0        # EnableRumbleEmulation
+                compat_v2 = (valid_flag2 & 0x04) != 0        # EnableImprovedRumbleEmulation
+                haptics_select = (valid_flag0 & 0x02) != 0   # UseRumbleNotHaptics
+                compatibility_selected = haptics_select or compat_v1 or compat_v2
+                motor_zero = (out_data[3] == 0 and out_data[4] == 0)
+                motor_active = not motor_zero
+                # Motor-aware passive locking arbitration:
+                # A 0x02 report with compat flags but ZERO motors is a DualSense
+                # feature-negotiation packet (audio filter setup etc.) and must NOT
+                # trigger compatibility mode — that causes an infinite flip-flop with
+                # concurrent audio-haptic SPECTRAL callbacks (observed: flag0=0x0d,
+                # motorR=0, motorL=0 during audio device test).
+                #
+                # Rules:
+                #   ENTER compat  : compat flags SET  *and* motors NON-ZERO
+                #   EXIT  compat  : motors become ZERO while already in compat (STOP packet)
+                #   IGNORE        : compat flags set but motors zero (feature packet)
+                _arb_now = time.perf_counter()
+                prev_mode = getattr(self, 'rumble_host_mode', 'audio_haptics')
+                if not hasattr(self, 'rumble_host_mode'):
+                    self.rumble_host_mode = prev_mode
+                mode_changed = False
+                last_audio_haptic_time = max(
+                    getattr(self, 'last_haptic_l_active_time', 0),
+                    getattr(self, 'last_haptic_r_active_time', 0),
+                )
+                # audio_recent = "another source is present" evidence.  An open audio ISO
+                # stream (even if silent) counts, as does recent converted haptic output.
+                # When another source is present, a motor=0 packet is only treated as a
+                # stop if it matches the rumble owner's signature/source fingerprint (below);
+                # otherwise it is a routine keepalive from the other source and is held.
+                is_audio_haptics_keepalive = (valid_flag0 == 0x00 and valid_flag2 == 0x0c)
+                audio_stream_recent = self._usbip_audio_stream_recent(_arb_now) or is_audio_haptics_keepalive
+                audio_recent = (
+                    USBIP_PS5_CONCURRENT_RUMBLE_TEST and
+                    (
+                        audio_stream_recent or
+                        (last_audio_haptic_time > 0 and
+                         _arb_now - last_audio_haptic_time <= SWITCH_RUMBLE_TIMEOUT)
+                    )
+                )
+                zero_signature = self._traditional_rumble_zero_signature(out_data)
+                flag_masked_signature = self._traditional_rumble_flag_masked_signature(out_data)
+                signature_match = (
+                    getattr(self, 'traditional_rumble_last_zero_signature', None) == zero_signature
+                )
+                flag_masked_match = (
+                    getattr(self, 'traditional_rumble_last_flag_masked_signature', None) == flag_masked_signature
+                )
+                # Source fingerprint: the stop must come from the same sender that STARTED
+                # the rumble.  Compare only the compat-relevant bits (flag0 & 0x03 = rumble
+                # emulation / haptics-select, flag2 & 0x04 = improved rumble emulation) —
+                # other bits in the flag bytes legitimately vary per packet.  A routine
+                # packet from the audio-haptics game (e.g. flag2=0x0c @60Hz) has different
+                # compat bits than the enter packet, so it can never be mistaken for a stop.
+                enter_bits = (
+                    (getattr(self, '_last_ordinary_flag0', 0) & 0x03) |
+                    ((getattr(self, '_last_ordinary_flag2', 0) & 0x04) << 8)
+                )
+                packet_bits = (valid_flag0 & 0x03) | ((valid_flag2 & 0x04) << 8)
+                source_fingerprint_stop = (
+                    packet_bits != 0 and (packet_bits & ~enter_bits) == 0
+                )
+                # A motor=0 packet is the host's explicit stop if it byte-matches the ping
+                # (exact), matches once valid_flag bytes are ignored (Steam drops them on
+                # stop), or carries compat bits that are a subset of the rumble owner's
+                # (same-source stop).
+                explicit_stop = (
+                    motor_zero and
+                    getattr(self, 'traditional_rumble_active', False) and
+                    (signature_match or flag_masked_match or source_fingerprint_stop)
+                )
+                # A stop that matched only by masked-signature or source fingerprint is
+                # AMBIGUOUS: another same-fingerprint source (e.g. Steam Ping shares the
+                # game's flag2=0x0c) can emit an identical-looking motor=0 report.  When
+                # another source is present and the rumble owner sent a non-zero motor
+                # within the defer window, hold the stop and schedule it for the owner's
+                # last-non-zero + window, so a burst rumble is not cut off mid-way.  A
+                # byte-exact match is unambiguous (same writer) and applies immediately.
+                stop_ambiguous = explicit_stop and not signature_match
+                last_nonzero = getattr(self, '_last_ordinary_rumble_time', 0)
+                defer_stop = (
+                    stop_ambiguous and audio_recent and
+                    _arb_now - last_nonzero < TRAD_RUMBLE_STOP_DEFER_WINDOW
+                )
+                zero_keepalive_for_audio = (
+                    motor_zero and
+                    audio_recent and
+                    getattr(self, 'traditional_rumble_active', False) and
+                    not explicit_stop
+                )
+
+                if compatibility_selected and motor_active:
+                    # Real rumble command — lock into compatibility mode.
+                    self._last_ordinary_rumble_time = _arb_now
+                    self._last_ordinary_flag0 = valid_flag0
+                    self._last_ordinary_flag2 = valid_flag2
+                    self.traditional_rumble_active = True
+                    self.traditional_rumble_zero_keepalive_seen = False
+                    self.traditional_rumble_last_zero_signature = zero_signature
+                    self.traditional_rumble_last_flag_masked_signature = flag_masked_signature
+                    self._trad_rumble_stop_diag_logged = False
+                    self._trad_rumble_pending_stop_at = None   # new motor value cancels a pending stop
+                    self.traditional_rumble_last_motor_r = out_data[3]
+                    self.traditional_rumble_last_motor_l = out_data[4]
+                elif defer_stop:
+                    # Hold the ambiguous stop; apply it once the owner has been silent for
+                    # the window (here, or via the getter fallback if no more packets come).
+                    if self._trad_rumble_pending_stop_at is None:
+                        self._trad_rumble_pending_stop_at = last_nonzero + TRAD_RUMBLE_STOP_DEFER_WINDOW
+                        logger.info(
+                            "Traditional rumble STOP deferred %.0fms (ambiguous stop while owner active): exact=%d flag_masked=%d fingerprint=%d (flag0=0x%02x flag2=0x%02x)",
+                            TRAD_RUMBLE_STOP_DEFER_WINDOW * 1000.0,
+                            int(signature_match), int(flag_masked_match), int(source_fingerprint_stop),
+                            valid_flag0, valid_flag2,
+                        )
+                elif zero_keepalive_for_audio:
+                    self.traditional_rumble_zero_keepalive_seen = True
+                    # One-shot dump per rumble session when a zero packet is held as a
+                    # keepalive, so drift beyond the flag bytes can be diagnosed later.
+                    if not getattr(self, '_trad_rumble_stop_diag_logged', False):
+                        self._trad_rumble_stop_diag_logged = True
+                        logger.debug(
+                            "Traditional rumble zero held as keepalive: packet=%s stored_sig=%s stored_masked=%s",
+                            bytes(out_data[:48]).hex(),
+                            (self.traditional_rumble_last_zero_signature or b'').hex(),
+                            (self.traditional_rumble_last_flag_masked_signature or b'').hex(),
+                        )
+                elif motor_zero and not zero_keepalive_for_audio and getattr(self, 'traditional_rumble_active', False):
+                    # Motors dropped to zero while ordinary rumble was the active source:
+                    # this is the host's stop.  Steam Input sends motor=0 to end rumble
+                    # and sometimes does NOT re-assert the compat flags, so the old
+                    # `if compatibility_selected` guard here swallowed the stop and the
+                    # rumble never ended.  Match the 0.12.1 traditional-rumble path: a zero
+                    # motor value clears ordinary rumble.  The traditional_rumble_active
+                    # guard keeps routine motor=0 reports (no rumble held) from log-spamming
+                    # and needlessly churning the vibration buffers.
+                    with self.vibration_lock:
+                        self._clear_traditional_rumble_locked()
+
+                # Only feed the ordinary motors in compatibility mode;
+                # otherwise the HD audio-haptic path owns the rumble.
+                if compatibility_selected and motor_active:
+                    lf_amp = int(800 * out_data[4] / 256)
+                    hf_amp = int(800 * out_data[3] / 256)
+                else:
+                    lf_amp = 0
+                    hf_amp = 0
+
+                # Adaptive Trigger Translation (Mode 0x26 Vibration and 0x02 Weapon Recoil)
+                trigger_r_amp = 0
+                trigger_r_freq = 0x0e1
+                trigger_l_amp = 0
+                trigger_l_freq = 0x0e1
+                
+                adaptive_triggers = getattr(CONFIG, "adaptive_triggers_enabled", True)
+                
+                if adaptive_triggers and len(out_data) >= 33:
+                    now = time.perf_counter()
+                    
+                    is_joycon = any(c.is_joycon() for c in getattr(self, 'controllers', []))
+                    trigger_amp_max = int(1000 * 0.5) if is_joycon else 1000
+                    
+                    # Right Trigger FFB
+                    rt_mode = out_data[11]
+                    rt_payload = bytes(out_data[11:22])
+                    
+                    # Log for debugging
+                    if rt_mode != 0:
+                        if now - getattr(self, 'last_rt_log_time', 0) > 0.5 or rt_mode != getattr(self, 'last_rt_mode', 0):
+                            logger.info(f"RT Adaptive FFB: Mode={hex(rt_mode)} Data={rt_payload[1:].hex()}")
+                            self.last_rt_log_time = now
+                            self.last_rt_mode = rt_mode
+                            
+                    # Trigger 150ms punch on payload change if physical trigger is currently held down
+                    if rt_payload != getattr(self, 'trigger_r_prev_payload', b''):
+                        self.trigger_r_prev_payload = rt_payload
+                        if getattr(self, 'prev_zr_pressed', False) and rt_mode not in (0x00, 0x05):
+                            self.trigger_r_punch_end = now + 0.150
+                            self.trigger_effect_seq = getattr(self, 'trigger_effect_seq', 0) + 1
+                            
+                    if now < getattr(self, 'trigger_r_punch_end', 0):
+                        trigger_r_amp = trigger_amp_max
+                        trigger_r_freq = 0x0e1
+
+                    # Left Trigger FFB
+                    lt_mode = out_data[22]
+                    lt_payload = bytes(out_data[22:33])
+                    
+                    # Log for debugging
+                    if lt_mode != 0:
+                        if now - getattr(self, 'last_lt_log_time', 0) > 0.5 or lt_mode != getattr(self, 'last_lt_mode', 0):
+                            logger.info(f"LT Adaptive FFB: Mode={hex(lt_mode)} Data={lt_payload[1:].hex()}")
+                            self.last_lt_log_time = now
+                            self.last_lt_mode = lt_mode
+                            
+                    # Trigger 150ms punch on payload change if physical trigger is currently held down
+                    if lt_payload != getattr(self, 'trigger_l_prev_payload', b''):
+                        self.trigger_l_prev_payload = lt_payload
+                        if getattr(self, 'prev_zl_pressed', False) and lt_mode not in (0x00, 0x05):
+                            self.trigger_l_punch_end = now + 0.150
+                            self.trigger_effect_seq = getattr(self, 'trigger_effect_seq', 0) + 1
+                            
+                    if now < getattr(self, 'trigger_l_punch_end', 0):
+                        trigger_l_amp = trigger_amp_max
+                        trigger_l_freq = 0x0e1
+
+                # In audio-haptics mode with no active trigger punch, don't touch the
+                # rumble frame at all — the HD audio-haptic path owns it.  Only ordinary
+                # motors (compatibility mode) or an active adaptive-trigger punch write here.
+                if motor_zero:
+                    self.last_rumble_received_time = time.perf_counter()
+                    return
+
+                dt = time.perf_counter() - self.cycle_start_time
+                slot_size = RUMBLE_WRITE_INTERVAL / 3.0
+                slot = int(dt / slot_size) if slot_size > 0 else 0
+                if slot < 0: slot = 0
+                elif slot > 2: slot = 2
+                
+                import math
+                with self.vibration_lock:
+                    # WinUHid perfectly aligned frequencies
+                    lf_freq = 0x0e1
+                    hf_freq = 0x1e1
+                        
+                    # Apply to Left (mix standard rumble with left trigger rumble)
+                    raw_lf_l = self.frame_vibrations_l[slot].lf_amp + lf_amp + trigger_l_amp
+                    raw_hf_l = self.frame_vibrations_l[slot].hf_amp + hf_amp + trigger_l_amp
+                    if raw_lf_l <= 560: self.frame_vibrations_l[slot].lf_amp = int(raw_lf_l)
+                    else: self.frame_vibrations_l[slot].lf_amp = int(560 + 240 * math.tanh((raw_lf_l - 560) / 240))
+                    if raw_hf_l <= 560: self.frame_vibrations_l[slot].hf_amp = int(raw_hf_l)
+                    else: self.frame_vibrations_l[slot].hf_amp = int(560 + 240 * math.tanh((raw_hf_l - 560) / 240))
+                    self.frame_vibrations_l[slot].lf_freq = trigger_l_freq if trigger_l_amp > 0 else lf_freq
+                    self.frame_vibrations_l[slot].hf_freq = trigger_l_freq if trigger_l_amp > 0 else hf_freq
+                    
+                    # Apply to Right (mix standard rumble with right trigger rumble)
+                    raw_lf_r = self.frame_vibrations_r[slot].lf_amp + lf_amp + trigger_r_amp
+                    raw_hf_r = self.frame_vibrations_r[slot].hf_amp + hf_amp + trigger_r_amp
+                    if raw_lf_r <= 560: self.frame_vibrations_r[slot].lf_amp = int(raw_lf_r)
+                    else: self.frame_vibrations_r[slot].lf_amp = int(560 + 240 * math.tanh((raw_lf_r - 560) / 240))
+                    if raw_hf_r <= 560: self.frame_vibrations_r[slot].hf_amp = int(raw_hf_r)
+                    else: self.frame_vibrations_r[slot].hf_amp = int(560 + 240 * math.tanh((raw_hf_r - 560) / 240))
+                    self.frame_vibrations_r[slot].lf_freq = trigger_r_freq if trigger_r_amp > 0 else lf_freq
+                    self.frame_vibrations_r[slot].hf_freq = trigger_r_freq if trigger_r_amp > 0 else hf_freq
+
+                    self.latest_vibration_l.lf_amp = min(1000, lf_amp + trigger_l_amp)
+                    self.latest_vibration_l.hf_amp = min(1000, hf_amp + trigger_l_amp)
+                    self.latest_vibration_l.lf_freq = trigger_l_freq if trigger_l_amp > 0 else lf_freq
+                    self.latest_vibration_l.hf_freq = trigger_l_freq if trigger_l_amp > 0 else hf_freq
+                    
+                    self.latest_vibration_r.lf_amp = min(1000, lf_amp + trigger_r_amp)
+                    self.latest_vibration_r.hf_amp = min(1000, hf_amp + trigger_r_amp)
+                    self.latest_vibration_r.lf_freq = trigger_r_freq if trigger_r_amp > 0 else lf_freq
+                    self.latest_vibration_r.hf_freq = trigger_r_freq if trigger_r_amp > 0 else hf_freq
+                    
+                    self.last_rumble_active_time = time.perf_counter()
+                    self.vibration_dirty_l = True
+                    self.vibration_dirty_r = True
+                    if lf_amp > 0 or hf_amp > 0:
+                        self.traditional_rumble_seq = getattr(self, 'traditional_rumble_seq', 0) + 1
+                    
+                # We can skip the LED/Audio flags check here to save time,
+                # as they are processed synchronously in the main _process_output_report thread
+                # with rate limiting. This callback focuses purely on minimizing latency for vibration packets.
+                
+        self.last_rumble_received_time = time.perf_counter()
+        return
+
+    def _usbip_audio_callback(self, data):
+        """Handle 4-channel audio stream from DualSense USBIP ep=1 OUT"""
+        if power_saving.is_full():
+            return
+        if hasattr(self, 'haptic_processor'):
+            if data is None or getattr(getattr(self, 'usbip_server', None), 'dualsense_haptics_blocked', False):
+                self.haptic_processor.reset()
+                self.last_usbip_audio_packet_time = 0.0
+                with self.vibration_lock:
+                    self.audio_haptic_frame_vibrations_l = [VibrationData() for _ in range(3)]
+                    self.audio_haptic_frame_vibrations_r = [VibrationData() for _ in range(3)]
+                    self.audio_haptic_latest_vibration_l = VibrationData()
+                    self.audio_haptic_latest_vibration_r = VibrationData()
+                    self.audio_haptic_vibration_dirty_l = True
+                    self.audio_haptic_vibration_dirty_r = True
+                    self.audio_haptic_ttl_l = 0
+                    self.audio_haptic_ttl_r = 0
+                    self.audio_haptic_seq = getattr(self, 'audio_haptic_seq', 0) + 1
+                self._wake_rumble_schedulers()
+                return
+            if len(data) > 0:
+                self.last_usbip_audio_packet_time = time.perf_counter()
+                self.haptic_processor.process_audio_packet(data)
+
+    def _proxy_haptic_callback(self, left_intensity, right_intensity, mode="CONTINUOUS", spectral=None):
+        if power_saving.is_full():
+            return
+        self.last_usbip_audio_packet_time = time.perf_counter()
+        self._haptic_callback(left_intensity, right_intensity, mode, spectral=spectral)
+
+    def _proxy_audio_activity_callback(self, active):
+        """Track PCM transport activity independently of non-zero haptic output."""
+        self.last_usbip_audio_packet_time = time.perf_counter() if active else 0.0
+
+    def _haptic_callback(self, left_intensity, right_intensity, mode="CONTINUOUS", spectral=None):
+        if power_saving.is_full():
+            return
+        # Passive locking arbitration: AudioPcm path switches BACK to audio_haptics
+        # only when a genuine SPECTRAL haptic signal arrives from Ch3/Ch4.
+        # SILENCE callbacks never change the mode (avoid releasing the lock on quiet frames).
+
+        if spectral is not None:
+            now = time.perf_counter()
+            slot = 0
+
+            left_lf_amp = int(spectral.get("left_lf_amp", 0))
+            left_hf_amp = int(spectral.get("left_hf_amp", 0))
+            right_lf_amp = int(spectral.get("right_lf_amp", 0))
+            right_hf_amp = int(spectral.get("right_hf_amp", 0))
+            left_lf_freq = int(spectral.get("left_lf_freq", 0))
+            left_hf_freq = int(spectral.get("left_hf_freq", 0))
+            right_lf_freq = int(spectral.get("right_lf_freq", 0))
+            right_hf_freq = int(spectral.get("right_hf_freq", 0))
+
+            is_joycon = any(c.is_joycon() for c in getattr(self, 'controllers', []))
+            if is_joycon:
+                left_lf_amp = min(left_lf_amp, 480)
+                right_lf_amp = min(right_lf_amp, 480)
+
+            with self.vibration_lock:
+                is_new_zero_l = (left_lf_amp == 0 and left_hf_amp == 0)
+                is_current_zero_l = (self.audio_haptic_frame_vibrations_l[0].lf_amp == 0 and self.audio_haptic_frame_vibrations_l[0].hf_amp == 0)
+                
+                if not is_new_zero_l or is_current_zero_l:
+                    for s in range(3):
+                        self.audio_haptic_frame_vibrations_l[s].lf_amp = left_lf_amp
+                        self.audio_haptic_frame_vibrations_l[s].hf_amp = left_hf_amp
+                        self.audio_haptic_frame_vibrations_l[s].lf_freq = left_lf_freq
+                        self.audio_haptic_frame_vibrations_l[s].hf_freq = left_hf_freq
+                    if not is_new_zero_l:
+                        self.audio_haptic_ttl_l = 3
+
+                is_new_zero_r = (right_lf_amp == 0 and right_hf_amp == 0)
+                is_current_zero_r = (self.audio_haptic_frame_vibrations_r[0].lf_amp == 0 and self.audio_haptic_frame_vibrations_r[0].hf_amp == 0)
+
+                if not is_new_zero_r or is_current_zero_r:
+                    for s in range(3):
+                        self.audio_haptic_frame_vibrations_r[s].lf_amp = right_lf_amp
+                        self.audio_haptic_frame_vibrations_r[s].hf_amp = right_hf_amp
+                        self.audio_haptic_frame_vibrations_r[s].lf_freq = right_lf_freq
+                        self.audio_haptic_frame_vibrations_r[s].hf_freq = right_hf_freq
+                    if not is_new_zero_r:
+                        self.audio_haptic_ttl_r = 3
+
+                self.audio_haptic_latest_vibration_l.lf_amp = left_lf_amp
+                self.audio_haptic_latest_vibration_l.hf_amp = left_hf_amp
+                self.audio_haptic_latest_vibration_l.lf_freq = left_lf_freq
+                self.audio_haptic_latest_vibration_l.hf_freq = left_hf_freq
+
+                self.audio_haptic_latest_vibration_r.lf_amp = right_lf_amp
+                self.audio_haptic_latest_vibration_r.hf_amp = right_hf_amp
+                self.audio_haptic_latest_vibration_r.lf_freq = right_lf_freq
+                self.audio_haptic_latest_vibration_r.hf_freq = right_hf_freq
+
+                self.audio_haptic_vibration_dirty_l = True
+                self.audio_haptic_vibration_dirty_r = True
+                self.audio_haptic_seq = getattr(self, 'audio_haptic_seq', 0) + 1
+                self.last_rumble_received_time = now
+            self._wake_rumble_schedulers()
+            return
+
+        def mix_freq(low, high, intensity):
+            return int(low + ((high - low) * intensity + 127) // 255)
+
+        # Scale intensity up to 255 for the freq mixer to preserve current freq behavior
+        max_intensity_raw = max(left_intensity, right_intensity)
+        freq_intensity = min(255, int((max_intensity_raw / 96.0) * 255.0))
+
+        if mode == "TICK":
+            hf_freq = mix_freq(0x1c8, 0x1f2, freq_intensity)
+            lf_freq = mix_freq(0x0c8, 0x0e8, freq_intensity)
+            hf_amp_pct = 100
+            lf_amp_pct = 28
+        elif mode == "PUNCH":
+            hf_freq = mix_freq(0x158, 0x198, freq_intensity)
+            lf_freq = mix_freq(0x0a8, 0x0d8, freq_intensity)
+            hf_amp_pct = 68
+            lf_amp_pct = 100
+        elif mode == "TEXTURE":
+            hf_freq = mix_freq(0x1a8, 0x1f8, freq_intensity)
+            lf_freq = mix_freq(0x0f0, 0x130, freq_intensity)
+            hf_amp_pct = 100
+            lf_amp_pct = 42
+        elif mode == "SILENCE":
+            hf_freq = 0
+            lf_freq = 0
+            hf_amp_pct = 0
+            lf_amp_pct = 0
+        else: # CONTINUOUS
+            hf_freq = mix_freq(0x180, 0x1a0, freq_intensity)
+            lf_freq = mix_freq(0x0d0, 0x100, freq_intensity)
+            hf_amp_pct = 100
+            lf_amp_pct = 100
+
+        # Note: We now properly separate Left and Right into their respective L/R states
+        # 整體強度 x2，並套用 WinUHid PS5 Xbox Rumble 高低頻震動強度上限 (800)
+        left_base_amp = min(800, int((left_intensity / 96.0) * 800.0 * 2.0))
+        right_base_amp = min(800, int((right_intensity / 96.0) * 800.0 * 2.0))
+        
+        left_lf_amp = int(left_base_amp * (lf_amp_pct / 100.0))
+        left_hf_amp = int(left_base_amp * (hf_amp_pct / 100.0))
+        
+        right_lf_amp = int(right_base_amp * (lf_amp_pct / 100.0))
+        right_hf_amp = int(right_base_amp * (hf_amp_pct / 100.0))
+        
+        is_joycon = any(c.is_joycon() for c in getattr(self, 'controllers', []))
+        if is_joycon:
+            left_lf_amp = min(left_lf_amp, 480)
+            right_lf_amp = min(right_lf_amp, 480)
+        
+        dt = time.perf_counter() - self.cycle_start_time
+        slot_size = RUMBLE_WRITE_INTERVAL / 3.0
+        slot = int(dt / slot_size) if slot_size > 0 else 0
+        if slot < 0: slot = 0
+        elif slot > 2: slot = 2
+
+        import math
+        with self.vibration_lock:
+            # [Antigravity Fix] Applying slot-based summation for Audio Haptics
+            # Apply to Left
+            raw_lf_l = self.audio_haptic_frame_vibrations_l[slot].lf_amp + left_lf_amp
+            raw_hf_l = self.audio_haptic_frame_vibrations_l[slot].hf_amp + left_hf_amp
+            if raw_lf_l <= 560: self.audio_haptic_frame_vibrations_l[slot].lf_amp = int(raw_lf_l)
+            else: self.audio_haptic_frame_vibrations_l[slot].lf_amp = int(560 + 240 * math.tanh((raw_lf_l - 560) / 240))
+            if raw_hf_l <= 560: self.audio_haptic_frame_vibrations_l[slot].hf_amp = int(raw_hf_l)
+            else: self.audio_haptic_frame_vibrations_l[slot].hf_amp = int(560 + 240 * math.tanh((raw_hf_l - 560) / 240))
+            self.audio_haptic_frame_vibrations_l[slot].lf_freq = lf_freq
+            self.audio_haptic_frame_vibrations_l[slot].hf_freq = hf_freq
+            
+            # Apply to Right
+            raw_lf_r = self.audio_haptic_frame_vibrations_r[slot].lf_amp + right_lf_amp
+            raw_hf_r = self.audio_haptic_frame_vibrations_r[slot].hf_amp + right_hf_amp
+            if raw_lf_r <= 560: self.audio_haptic_frame_vibrations_r[slot].lf_amp = int(raw_lf_r)
+            else: self.audio_haptic_frame_vibrations_r[slot].lf_amp = int(560 + 240 * math.tanh((raw_lf_r - 560) / 240))
+            if raw_hf_r <= 560: self.audio_haptic_frame_vibrations_r[slot].hf_amp = int(raw_hf_r)
+            else: self.audio_haptic_frame_vibrations_r[slot].hf_amp = int(560 + 240 * math.tanh((raw_hf_r - 560) / 240))
+            self.audio_haptic_frame_vibrations_r[slot].lf_freq = lf_freq
+            self.audio_haptic_frame_vibrations_r[slot].hf_freq = hf_freq
+            
+            now = time.perf_counter()
+            # Only overwrite latest when amplitude is non-zero.  If the haptic
+            # callback fires with a silent side (e.g. right=0 while left is
+            # active), writing 0 into latest_r would immediately stop the R
+            # motor on the next non-dirty read – producing the complementary
+            # L↔R alternation stutter.  Holding the last non-zero value lets
+            # the motor sustain; a per-side 150ms watchdog in
+            # get_current_vibration_frames stops it after true silence.
+            if left_lf_amp > 0 or left_hf_amp > 0:
+                self.audio_haptic_latest_vibration_l.lf_amp = left_lf_amp
+                self.audio_haptic_latest_vibration_l.hf_amp = left_hf_amp
+                self.audio_haptic_latest_vibration_l.lf_freq = lf_freq
+                self.audio_haptic_latest_vibration_l.hf_freq = hf_freq
+                self.last_haptic_l_active_time = now
+
+            if right_lf_amp > 0 or right_hf_amp > 0:
+                self.audio_haptic_latest_vibration_r.lf_amp = right_lf_amp
+                self.audio_haptic_latest_vibration_r.hf_amp = right_hf_amp
+                self.audio_haptic_latest_vibration_r.lf_freq = lf_freq
+                self.audio_haptic_latest_vibration_r.hf_freq = hf_freq
+                self.last_haptic_r_active_time = now
+
+            self.audio_haptic_vibration_dirty_l = True
+            self.audio_haptic_vibration_dirty_r = True
+            self.audio_haptic_seq = getattr(self, 'audio_haptic_seq', 0) + 1
+            self.last_rumble_received_time = now
+        self._wake_rumble_schedulers()
+
+    def _usbip_rumble_callback(self, out_data, side="Left"):
+        delay = getattr(CONFIG, "rumble_delay_ms", 0)
+        if delay > 0:
+            import threading
+            threading.Timer(delay / 1000.0, self._run_rumble_callback, args=(self._usbip_rumble_callback_internal, out_data, side)).start()
+        else:
+            self._run_rumble_callback(self._usbip_rumble_callback_internal, out_data, side)
+
+    def _usbip_rumble_callback_internal(self, out_data, side="Left"):
+        # Disconnect active-push: bytearray(64) from usbip_server means connection dropped
+        # In this case out_data[0] == 0x00, so we handle it separately to clear rumble state.
+        if len(out_data) < 1:
+            return
+            
+        if self.mode == "Switch1":
+            if out_data[0] == 0: # Connection dropped
+                with self.vibration_lock:
+                    if side == "Left":
+                        self.switch_vibrations_left = [VibrationData() for _ in range(3)]
+                        self.vibration_dirty_l = True
+                    elif side == "Right":
+                        self.switch_vibrations_right = [VibrationData() for _ in range(3)]
+                        self.vibration_dirty_r = True
+                    else: # Pro
+                        self.switch_vibrations_left = [VibrationData() for _ in range(3)]
+                        self.switch_vibrations_right = [VibrationData() for _ in range(3)]
+                        self.vibration_dirty_l = True
+                        self.vibration_dirty_r = True
+                return
+                
+            def decode_32bit_rumble(b):
+                hf_amp = b[1] & 0xFE
+                hf_amp_encoded = hf_amp >> 1
+                lf_amp_encoded = (b[3] - 64) * 2 + (1 if (b[2] & 0x80) else 0)
+                lf_amp_encoded = max(0, lf_amp_encoded)
+                
+                def encoded_to_linear(encoded):
+                    if encoded <= 0:
+                        return 0.0
+                    if encoded >= 32:
+                        return (2.0 ** (encoded / 32.0)) / 8.7
+                    elif encoded >= 16:
+                        return (2.0 ** (encoded / 16.0)) / 17.0
+                    else:
+                        return (encoded / 16.0) * 0.12
+                
+                hf_val = int(encoded_to_linear(hf_amp_encoded) * 800)
+                lf_val = int(encoded_to_linear(lf_amp_encoded) * 800)
+                
+                hf_freq_encoded = b[0] | ((b[1] & 0x01) << 8)
+                lf_freq_encoded = b[2] & 0x7F
+                
+                return VibrationData(
+                    lf_freq=lf_freq_encoded,
+                    lf_en_tone=False,
+                    lf_amp=lf_val,
+                    hf_freq=hf_freq_encoded,
+                    hf_en_tone=False,
+                    hf_amp=hf_val
+                )
+
+            if len(out_data) >= 6:
+                rumble_mode = getattr(CONFIG, "rumble_mode", "Xbox")
+                if side == "Left":
+                    v1 = decode_32bit_rumble(out_data[2:6])
+                    if rumble_mode != "Switch":
+                        v1.lf_freq = 0x0e1; v1.hf_freq = 0x1e1
+                    v2 = v1
+                    v3 = v1
+                    with self.vibration_lock:
+                        self.switch_vibrations_left = [v1, v2, v3]
+                        self.vibration_dirty_l = True
+                elif side == "Right":
+                    if len(out_data) >= 10:
+                        v1 = decode_32bit_rumble(out_data[6:10])
+                    else:
+                        v1 = decode_32bit_rumble(out_data[2:6])
+                    if rumble_mode != "Switch":
+                        v1.lf_freq = 0x0e1; v1.hf_freq = 0x1e1
+                    v2 = v1
+                    v3 = v1
+                    with self.vibration_lock:
+                        self.switch_vibrations_right = [v1, v2, v3]
+                        self.vibration_dirty_r = True
+                else: # Pro
+                    v1_left = decode_32bit_rumble(out_data[2:6])
+                    if len(out_data) >= 10:
+                        v1_right = decode_32bit_rumble(out_data[6:10])
+                    else:
+                        v1_right = decode_32bit_rumble(out_data[2:6])
+                    if rumble_mode != "Switch":
+                        v1_left.lf_freq = 0x0e1; v1_left.hf_freq = 0x1e1
+                        v1_right.lf_freq = 0x0e1; v1_right.hf_freq = 0x1e1
+                    with self.vibration_lock:
+                        self.switch_vibrations_left = [v1_left, v1_left, v1_left]
+                        self.switch_vibrations_right = [v1_right, v1_right, v1_right]
+                        self.vibration_dirty_l = True
+                        self.vibration_dirty_r = True
+            
+            self.last_rumble_received_time = time.perf_counter()
+            return
+
+        if out_data[0] != 0x02:
+            # Explicitly clear all rumble state on disconnect (or unknown packet)
+            with self.vibration_lock:
+                self.frame_vibrations = [VibrationData() for _ in range(3)]
+                for i in range(3):
+                    self.slot_inputs[i].clear()
+                    self.slot_inputs[i].append((0x0e1, 0, 0x1e1, 0))
+                self.latest_vibration = VibrationData(lf_amp=0, hf_amp=0)
+                for i in range(3):
+                    self.slot_inputs_right[i].clear()
+                    self.slot_inputs_right[i].append((0x0e1, 0, 0x1e1, 0))
+                self.vibration_dirty = True
+                self.rumble_force_clear = True  # Signal controller.py to reset rumble_stopped
+                self.last_rumble_active_time = 0
+            # Reset watchdog so it does NOT fire immediately after this clear
+            self.last_rumble_received_time = time.perf_counter()
+            return
+
+        # Valid packet received. Only active rumble refreshes the hold watchdog; neutral
+        # keepalives must not cut continuous rumble between active frames.
+        packet_time = time.perf_counter()
+        self.last_rumble_received_time = packet_time
+            
+        def is_neutral(offset):
+            return (out_data[offset] == 0x87 and 
+                    out_data[offset+1] == 0x01 and 
+                    out_data[offset+2] == 0x20 and 
+                    out_data[offset+3] == 0x11 and 
+                    out_data[offset+4] == 0x00)
+                    
+        def vibration_data_from_bytes(b):
+            value = int.from_bytes(b, byteorder='little')
+            return VibrationData(
+                lf_freq = value & 0x1FF,
+                lf_en_tone = bool((value >> 9) & 1),
+                lf_amp = (value >> 10) & 0x3FF,
+                hf_freq = (value >> 20) & 0x1FF,
+                hf_en_tone = bool((value >> 29) & 1),
+                hf_amp = (value >> 30) & 0x3FF
+            )
+            
+        def decode_5byte_frame(frame_bytes):
+            value = int.from_bytes(frame_bytes, byteorder='little')
+            lf_freq = value & 0x1FF
+            lf_amp_10bit = (value >> 10) & 0x3FF
+            hf_freq = (value >> 20) & 0x1FF
+            hf_amp_10bit = (value >> 30) & 0x3FF
+            
+            # Extract 7-bit amplitudes
+            lf_amp_7bit = int(lf_amp_10bit * 127 / 1023)
+            hf_amp_7bit = int(hf_amp_10bit * 127 / 1023)
+            
+            # Scale to 0-800 scale
+            lf_val = int(lf_amp_7bit * 800 / 127)
+            hf_val = int(hf_amp_7bit * 800 / 127)
+            
+            return lf_freq, lf_val, hf_freq, hf_val
+            
+        active = False
+        for b in out_data[2:]:
+            if b != 0:
+                active = True
+                break
+                
+        if len(out_data) >= 23 and is_neutral(2) and is_neutral(18):
+            active = False
+            
+        rumble_mode = getattr(CONFIG, "rumble_mode", "Xbox")
+        
+        if active:
+            self.last_rumble_active_time = packet_time
+            v1 = vibration_data_from_bytes(out_data[2:7])
+            v2 = vibration_data_from_bytes(out_data[7:12])
+            v3 = vibration_data_from_bytes(out_data[12:17])
+            
+            if rumble_mode != "Switch":
+                XBOX_LF_FREQ = 0x0e1
+                XBOX_HF_FREQ = 0x1e1
+                
+                v1.lf_freq = XBOX_LF_FREQ; v1.hf_freq = XBOX_HF_FREQ
+                v2.lf_freq = XBOX_LF_FREQ; v2.hf_freq = XBOX_HF_FREQ
+                v3.lf_freq = XBOX_LF_FREQ; v3.hf_freq = XBOX_HF_FREQ
+
+            def _copy_vib(vd):
+                return VibrationData(
+                    lf_freq=vd.lf_freq, lf_en_tone=vd.lf_en_tone, lf_amp=vd.lf_amp,
+                    hf_freq=vd.hf_freq, hf_en_tone=vd.hf_en_tone, hf_amp=vd.hf_amp)
+            with self.vibration_lock:
+                self.frame_vibrations = [v1, v2, v3]
+                self.latest_vibration = v3
+                self.vibration_dirty = True
+                # Also populate the PER-SIDE buffers that get_current_vibration_frames()
+                # actually consumes for Switch2 (the shared buffer alone is never read
+                # there, which is why Switch2 rumble appeared dead). Use independent
+                # copies so each side's consume (which zeroes its frames) can't clear
+                # the other. Switch 2 sends one rumble for the merged pair, so both
+                # sides get the same waveform.
+                self.frame_vibrations_l = [_copy_vib(v1), _copy_vib(v2), _copy_vib(v3)]
+                self.frame_vibrations_r = [_copy_vib(v1), _copy_vib(v2), _copy_vib(v3)]
+                self.latest_vibration_l = _copy_vib(v3)
+                self.latest_vibration_r = _copy_vib(v3)
+                self.vibration_dirty_l = True
+                self.vibration_dirty_r = True
+        else:
+            last_active = getattr(self, 'last_rumble_active_time', 0)
+            if not last_active or packet_time - last_active > SWITCH_RUMBLE_TIMEOUT:
+                with self.vibration_lock:
+                    self.frame_vibrations = [VibrationData() for _ in range(3)]
+                    self.latest_vibration = VibrationData()
+                    self.vibration_dirty = True
+                    self.frame_vibrations_l = [VibrationData() for _ in range(3)]
+                    self.frame_vibrations_r = [VibrationData() for _ in range(3)]
+                    self.latest_vibration_l = VibrationData()
+                    self.latest_vibration_r = VibrationData()
+                    self.vibration_dirty_l = True
+                    self.vibration_dirty_r = True
+
+    def update_as_switch2_pro(self, inputData: ControllerInputData, buttons: int, controller: Controller):
+        state = bytearray(64)
+        state[0] = 0x05
+        state[2] = 0x12
+        
+        b5 = 0
+        if buttons & SWITCH_BUTTONS["Y"]: b5 |= 0x01
+        if buttons & SWITCH_BUTTONS["X"]: b5 |= 0x02
+        if buttons & SWITCH_BUTTONS["B"]: b5 |= 0x04
+        if buttons & SWITCH_BUTTONS["A"]: b5 |= 0x08
+        if buttons & SWITCH_BUTTONS["R"]: b5 |= 0x40
+        if buttons & SWITCH_BUTTONS["ZR"]: b5 |= 0x80
+        state[5] = b5
+        
+        b6 = 0
+        if buttons & SWITCH_BUTTONS["MINUS"]: b6 |= 0x01
+        if buttons & SWITCH_BUTTONS["PLUS"]: b6 |= 0x02
+        if buttons & SWITCH_BUTTONS["R_STK"]: b6 |= 0x04
+        if buttons & SWITCH_BUTTONS["L_STK"]: b6 |= 0x08
+        if buttons & SWITCH_BUTTONS.get("HOME", 0): b6 |= 0x10
+        if buttons & SWITCH_BUTTONS.get("CAPT", 0): b6 |= 0x20
+        if buttons & SWITCH_BUTTONS.get("C", 0): b6 |= 0x40
+        state[6] = b6
+        
+        b7 = 0
+        if buttons & SWITCH_BUTTONS["DOWN"]: b7 |= 0x01
+        if buttons & SWITCH_BUTTONS["UP"]: b7 |= 0x02
+        if buttons & SWITCH_BUTTONS["RIGHT"]: b7 |= 0x04
+        if buttons & SWITCH_BUTTONS["LEFT"]: b7 |= 0x08
+        if buttons & SWITCH_BUTTONS["L"]: b7 |= 0x40
+        if buttons & SWITCH_BUTTONS["ZL"]: b7 |= 0x80
+        state[7] = b7
+        
+        # Safeguard GL/GR for Joycons: only allow if mapped
+        if controller.is_joycon():
+            mapping_scope = self._controller_mapping_scope(controller)
+            joycon_mappings = [
+                CONFIG.get_mapping_setting_scoped("home", "Default", mapping_scope),
+                CONFIG.get_mapping_setting_scoped("capt", "Capture" if getattr(CONFIG, "simulation_mode", "PS5") in ("Switch1", "Switch2") else "PrtSc", mapping_scope),
+                CONFIG.get_mapping_setting_scoped("c", "Default", mapping_scope),
+                CONFIG.get_mapping_setting_scoped("sll", "Default", mapping_scope),
+                CONFIG.get_mapping_setting_scoped("srl", "Default", mapping_scope),
+                CONFIG.get_mapping_setting_scoped("slr", "Default", mapping_scope),
+                CONFIG.get_mapping_setting_scoped("srr", "Default", mapping_scope),
+            ]
+            if "GL" not in joycon_mappings:
+                buttons &= ~SWITCH_BUTTONS.get("GL", 0x02000000)
+            if "GR" not in joycon_mappings:
+                buttons &= ~SWITCH_BUTTONS.get("GR", 0x01000000)
+
+        b8 = 0
+        if buttons & SWITCH_BUTTONS.get("GR", 0): b8 |= 0x01
+        if buttons & SWITCH_BUTTONS.get("GL", 0): b8 |= 0x02
+        state[8] = b8
+
+        # Joystick and IMU routing
+        custom_stick_route = getattr(inputData, 'custom_joystick_mapping', None)
+        if len(self.controllers) == 1:
+            if not controller.is_joycon() and (
+                self._joystick_mapping_mode("l_joystick", controller) in ("L Joystick", "R Joystick") or
+                self._joystick_mapping_mode("r_joystick", controller) in ("L Joystick", "R Joystick")
+            ):
+                mixed_left, mixed_right = self._update_merged_stick_mix(inputData, controller)
+                self.last_s2_lx = mixed_left[0]
+                self.last_s2_ly = mixed_left[1]
+                self.last_s2_rx = mixed_right[0]
+                self.last_s2_ry = mixed_right[1]
+            elif custom_stick_route:
+                self.last_s2_lx = inputData.left_stick[0]
+                self.last_s2_ly = inputData.left_stick[1]
+                self.last_s2_rx = inputData.right_stick[0]
+                self.last_s2_ry = inputData.right_stick[1]
+            elif controller.is_joycon_right():
+                if self.hold_mode == "Vertical":
+                    self.last_s2_rx = inputData.right_stick[0]
+                    self.last_s2_ry = inputData.right_stick[1]
+                    self.last_s2_lx = 0.0
+                    self.last_s2_ly = 0.0
+                else: # Horizontal
+                    self.last_s2_lx = inputData.right_stick[0]
+                    self.last_s2_ly = inputData.right_stick[1]
+                    self.last_s2_rx = 0.0
+                    self.last_s2_ry = 0.0
+            else: # Joycon Left or Pro Controller
+                self.last_s2_lx = inputData.left_stick[0]
+                self.last_s2_ly = inputData.left_stick[1]
+                self.last_s2_rx = inputData.right_stick[0]
+                self.last_s2_ry = inputData.right_stick[1]
+
+            self.last_s2_rx, self.last_s2_ry = self._add_gyro_rstick_overlay(
+                self.last_s2_rx,
+                self.last_s2_ry,
+                inputData,
+            )
+            
+            if self.hold_mode == "Horizontal" and not controller.is_pro_controller():
+                if controller.is_joycon_right():
+                    self.last_s2_gx = inputData.gyroscope[1]
+                    self.last_s2_gy = inputData.gyroscope[2]
+                    self.last_s2_gz = -inputData.gyroscope[0]
+                    self.last_s2_ax = -inputData.accelerometer[1]
+                    self.last_s2_ay = inputData.accelerometer[2]
+                    self.last_s2_az = inputData.accelerometer[0]
+                else:
+                    self.last_s2_gx = -inputData.gyroscope[1]
+                    self.last_s2_gy = inputData.gyroscope[2]
+                    self.last_s2_gz = inputData.gyroscope[0]
+                    self.last_s2_ax = -inputData.accelerometer[1]
+                    self.last_s2_ay = inputData.accelerometer[2]
+                    self.last_s2_az = -inputData.accelerometer[0]
+            else:
+                self.last_s2_gx = inputData.gyroscope[0]
+                self.last_s2_gy = inputData.gyroscope[2]
+                self.last_s2_gz = -inputData.gyroscope[1]
+                self.last_s2_ax = inputData.accelerometer[0]
+                self.last_s2_ay = inputData.accelerometer[2]
+                self.last_s2_az = -inputData.accelerometer[1]
+        else: # Dual Joycons (len == 2)
+            mixed_left, mixed_right = self._update_merged_stick_mix(inputData, controller)
+            mixed_right = self._add_gyro_rstick_overlay(mixed_right[0], mixed_right[1], inputData)
+            self.last_s2_lx = mixed_left[0]
+            self.last_s2_ly = mixed_left[1]
+            self.last_s2_rx = mixed_right[0]
+            self.last_s2_ry = mixed_right[1]
+                
+            if self._is_djg_none_merge():
+                merged_g, merged_a = self._direct_merged_motion(inputData)
+                self.last_s2_gx = merged_g[0]
+                self.last_s2_gy = merged_g[2]
+                self.last_s2_gz = -merged_g[1]
+                self.last_s2_ax = merged_a[0]
+                self.last_s2_ay = merged_a[2]
+                self.last_s2_az = -merged_a[1]
+            elif getattr(controller, 'gyro_active', False):
+                self.last_s2_gx = inputData.gyroscope[0]
+                self.last_s2_gy = inputData.gyroscope[2]
+                self.last_s2_gz = -inputData.gyroscope[1]
+                self.last_s2_ax = inputData.accelerometer[0]
+                self.last_s2_ay = inputData.accelerometer[2]
+                self.last_s2_az = -inputData.accelerometer[1]
+
+        if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:
+            steer = getattr(controller, '_shared_steer_value', controller._own_steer_value if hasattr(controller, '_own_steer_value') else 0.0)
+            self.last_s2_lx = steer
+
+        def float_to_12bit(val):
+            return int(max(0, min(4095, round((val + 1.0) * 2047.5))))
+            
+        lx = float_to_12bit(self.last_s2_lx)
+        ly = float_to_12bit(self.last_s2_ly)
+        rx = float_to_12bit(self.last_s2_rx)
+        ry = float_to_12bit(self.last_s2_ry)
+        
+        state[11] = lx & 0xff
+        state[12] = ((lx >> 8) & 0x0f) | ((ly & 0x0f) << 4)
+        state[13] = (ly >> 4) & 0xff
+        
+        state[14] = rx & 0xff
+        state[15] = ((rx >> 8) & 0x0f) | ((ry & 0x0f) << 4)
+        state[16] = (ry >> 4) & 0xff
+        
+        # Microsecond timestamp (32-bit LE) at bytes 32-35
+        now_us = int(time.perf_counter() * 1000000) & 0xffffffff
+        state[32:36] = struct.pack("<I", now_us)
+        
+        # Byte 42 = 0x01
+        state[42] = 0x01
+        
+        # Microsecond timestamp (32-bit LE) at bytes 43-46
+        state[43:47] = struct.pack("<I", now_us)
+        
+        # IMU sequence counter (16-bit LE) at bytes 47-48
+        imu_seq = getattr(controller, '_imu_seq', 0)
+        state[47:49] = struct.pack("<H", imu_seq)
+        controller._imu_seq = (imu_seq + 1) & 0xffff
+        
+        def clamp_i16(v): return max(-32768, min(32767, int(round(v))))
+
+        raw_gx = clamp_i16(self.last_s2_gx)
+        raw_gy = clamp_i16(self.last_s2_gz)  # Swap Yaw and Roll for Switch 2 Emu: Y is Roll
+        raw_gz = clamp_i16(self.last_s2_gy)  # Z is Yaw
+        raw_ax = clamp_i16(self.last_s2_ax)
+        raw_ay = clamp_i16(self.last_s2_az)  # Y is Roll/Y-axis
+        raw_az = clamp_i16(self.last_s2_ay)  # Z is Yaw/Z-axis
+
+        state[49:61] = struct.pack('<6h', raw_ax, raw_ay, raw_az, raw_gx, raw_gy, raw_gz)
+        
+        if hasattr(self, 'usbip_server') and self.usbip_server:
+            self.usbip_server.update_state(state)
+            return True
+        return False
+
+
+
+def reset_vigem_bus(force=False):
+    """
+    Force-reset the global ViGEm bus handle used by vgamepad.
+    This is critical for preventing BSOD (0x10D) during sleep/wake cycles.
+    """
+    if not force and getattr(CONFIG, "driver_type", "WinUHid") != "ViGEmBus":
+        logger.info("reset_vigem_bus called (no-op for WinUHid)")
+        return
+        
+    try:
+        get_vigem()
+    except Exception as e:
+        logger.error(f"Cannot reset ViGEm bus: {e}")
+        return
+        
+    import vgamepad.win.virtual_gamepad as vvg
+    import gc
+    
+    logger.info("Resetting ViGEm bus handle for power state transition.")
+    try:
+        # 1. Clear the global singleton reference
+        if hasattr(vvg, 'VBUS'):
+            old_bus = vvg.VBUS
+            vvg.VBUS = None
+            # Explicitly delete to encourage immediate cleanup
+            if old_bus:
+                try:
+                    # Access private members to force disconnect if __del__ hasn't run yet
+                    import vgamepad.win.vigem_client as vcli
+                    if hasattr(old_bus, '_busp') and old_bus._busp:
+                        logger.debug("Manually disconnecting stale ViGEm bus.")
+                        vcli.vigem_disconnect(old_bus._busp)
+                        vcli.vigem_free(old_bus._busp)
+                        old_bus._busp = None
+                except:
+                    pass
+                del old_bus
+        
+        # 2. Collect garbage to ensure VBus.__del__ runs and driver handles are closed
+        gc.collect()
+        
+        # 3. Create a fresh VBus instance for the next use cycle
+        # We only do this if we are not currently suspending
+        from discoverer import _IS_SUSPENDING
+        if not _IS_SUSPENDING:
+            vvg.VBUS = vvg.VBus()
+            logger.info("New ViGEm bus handle initialized.")
+        else:
+            logger.info("ViGEm bus cleared for suspend. Will re-init on wake.")
+    except Exception as e:
+        logger.error(f"Error resetting ViGEm bus: {e}")

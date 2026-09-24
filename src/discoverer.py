@@ -1,0 +1,2354 @@
+# Switch2Connect - A Python and ESP32-S3 bridge utility for Switch 2 controller inputs.
+# Copyright (C) 2026 TommyWabg
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# Contact Information:
+# Electronic Mail: tommyw9318@gmail.com
+
+"""A class used to find switch 2 controllers via Bluetooth
+"""
+import threading
+from bleak import BleakScanner, BleakClient, BleakGATTCharacteristic
+import power_saving
+from bleak.backends.device import BLEDevice
+from bleak.backends.scanner import AdvertisementData
+from bleak.exc import BleakError
+import asyncio
+import logging
+import json
+import yaml
+from utils import to_hex, convert_mac_string_to_value, decodeu, show_notification
+import time
+import os
+from controller import Controller, ControllerInputData, NINTENDO_VENDOR_ID, CONTROLER_NAMES, VibrationData, NSO_GAMECUBE_CONTROLLER_PID
+from virtual_controller import VirtualController
+from config import CONFIG
+
+logger = logging.getLogger(__name__)
+
+NINTENDO_BLUETOOTH_MANUFACTURER_ID = 0x0553
+VIRTUAL_CONTROLLERS = [None] * 10
+UPDATE_CALLBACK = None
+DISCOVERER_LOOP = None
+DISCONNECT_CALLBACK = None
+IS_SHUTTING_DOWN = False
+DISCOVERY_LOCK = threading.Lock()
+_CURRENTLY_DISCOVERING = False
+_IS_SUSPENDING = False
+GLOBAL_LOCK = None
+CONNECTION_LOCK = None
+# Set to False while the BLE scanner is in the error-retry loop (Bluetooth off/unavailable).
+# The GUI header reads this to show "Disconnect" instead of "Ready" for the system BLE route.
+_SYSTEM_BT_AVAILABLE = True
+
+# Opt-in terminal diagnostics for the System Bluetooth route only.  Keep this
+# independent of the root log level so normal users and every other transport
+# retain their current logging volume and timing.
+_SYSTEM_BT_DIAGNOSTICS = os.environ.get("SWITCH2_SYSTEM_BT_DIAGNOSTICS", "0") == "1"
+_SYSTEM_BT_DIAG_SESSION = os.urandom(2).hex().upper()
+_SYSTEM_BT_DIAG_LAST = {}
+
+
+def _sysbt_device_id(address):
+    text = str(address or "unknown").replace("-", ":")
+    parts = text.split(":")
+    return "JC-" + "".join(parts[-3:]).upper() if len(parts) >= 3 else text
+
+
+def _sysbt_device_ids(addresses):
+    return [_sysbt_device_id(address) for address in addresses]
+
+
+def _sysbt_diag(message, *args, rate_key=None, rate_seconds=0.0):
+    if not _SYSTEM_BT_DIAGNOSTICS:
+        return
+    if rate_key:
+        now = time.monotonic()
+        if now - _SYSTEM_BT_DIAG_LAST.get(rate_key, 0.0) < rate_seconds:
+            return
+        _SYSTEM_BT_DIAG_LAST[rate_key] = now
+    logger.info("[SYSBT-DIAG session=%s] " + message,
+                _SYSTEM_BT_DIAG_SESSION, *args)
+
+
+def _sysbt_error_class(stage, error, peer_dropped=False):
+    text = f"{type(error).__name__}: {error}".lower()
+    if peer_dropped:
+        return "FIRST_SIDE_DROPPED_DURING_SECOND_CONNECT"
+    if "service" in text or "characteristic" in text:
+        return "GATT_SERVICE_MISSING"
+    if "notify" in text:
+        return "NOTIFICATION_SETUP_FAILED"
+    if "timeout" in text:
+        return ("CONTROLLER_INITIALIZATION_TIMEOUT" if stage == "initialize_started"
+                else "SECOND_GATT_LINK_REJECTED")
+    if stage in ("merge_started", "virtual_device_setup_started"):
+        return "VIRTUAL_MERGE_FAILED"
+    if stage == "pair_started":
+        return "PAIRING_FAILED"
+    return "SYSTEM_BT_CONNECTION_FAILED"
+WIRED_RESCAN_EVENT = None
+WIRED_RESCAN_REQUESTS = []
+WIRED_RESCAN_LOCK = threading.Lock()
+
+# Ceilings for the wired add/remove path. These only bound how long a *stuck* operation
+# can block; they add no background work. Without them a single hung driver or libusb
+# call leaves the device key in `connecting` forever, and every later scan -- including
+# a manual one -- skips that device until the app is restarted.
+ADD_INITIALIZE_TIMEOUT = 8.0
+ADD_SETUP_TIMEOUT = 8.0
+DISCONNECT_TIMEOUT = 5.0
+# A `connecting` entry older than this is a task that died without running its `finally`
+# (or is wedged past every ceiling above). Swept from the watcher's existing idle tick.
+CONNECTING_STALE_TIMEOUT = 15.0
+
+def request_wired_rescan(reason: str = "manual_refresh", candidate_path=None, manual: bool = False):
+    """Request one wired Pro Controller discovery pass from any thread."""
+    global WIRED_RESCAN_EVENT
+    with WIRED_RESCAN_LOCK:
+        WIRED_RESCAN_REQUESTS.append((reason, candidate_path, bool(manual)))
+    loop = DISCOVERER_LOOP
+    event = WIRED_RESCAN_EVENT
+    if loop and event and loop.is_running():
+        loop.call_soon_threadsafe(event.set)
+
+def set_wired_auto_scan_enabled(enabled: bool):
+    CONFIG.wired_auto_scan_enabled = bool(enabled)
+    CONFIG.wired_usb_enabled = bool(enabled)
+    if enabled:
+        request_wired_rescan("toggle_on")
+
+def is_system_bluetooth_available() -> bool:
+    return _SYSTEM_BT_AVAILABLE
+
+
+# Set by the GUI's device-change listener when a Bluetooth radio arrives or is removed.
+# The wireless route waits on this instead of retrying on a timer, so a machine with no
+# radio costs nothing until one actually appears.
+BLUETOOTH_RADIO_EVENT = None
+
+
+def notify_bluetooth_radio_changed():
+    """Wake the wireless route after a Bluetooth radio arrived or was removed.
+
+    Safe to call from any thread -- mirrors request_wired_rescan() above.
+    """
+    loop = DISCOVERER_LOOP
+    event = BLUETOOTH_RADIO_EVENT
+    if loop and event and loop.is_running():
+        try:
+            loop.call_soon_threadsafe(event.set)
+        except RuntimeError:
+            pass
+
+
+async def _wait_for_bluetooth_radio(quit_event) -> bool:
+    """Block until a Bluetooth radio change is signalled. False when the app is quitting.
+
+    Also re-checks on a slow timer as a backstop: toggling Bluetooth off/on in Windows
+    Settings does not reliably raise a radio device-interface arrival, so an event-only
+    wait could miss it. 30 s is far too coarse to cost anything, and this only runs while
+    there is no usable radio.
+    """
+    from utils import bluetooth_radio_present
+    RADIO_PROBE_INTERVAL = 30.0
+    last_probe = time.monotonic()
+    while not quit_event.is_set():
+        try:
+            # quit_event is a threading.Event and cannot be awaited, so wake up often
+            # enough to notice it. This is shutdown latency, not the probe interval --
+            # waiting the full 30 s here made quitting take up to half a minute.
+            await asyncio.wait_for(BLUETOOTH_RADIO_EVENT.wait(), timeout=1.0)
+            BLUETOOTH_RADIO_EVENT.clear()
+            await asyncio.sleep(1.0)   # let the stack settle after the arrival
+            return not quit_event.is_set()
+        except asyncio.TimeoutError:
+            now = time.monotonic()
+            if now - last_probe >= RADIO_PROBE_INTERVAL:
+                last_probe = now
+                if await asyncio.to_thread(bluetooth_radio_present):
+                    logger.info("Bluetooth radio detected by periodic check.")
+                    return not quit_event.is_set()
+    return False
+
+
+async def auto_disconnect_checker(quit_event):
+    logger.info("Auto disconnect checker task started.")
+    while not quit_event.is_set():
+        try:
+            await asyncio.sleep(1.0)
+            if not getattr(CONFIG, "auto_disconnect_enabled", False):
+                continue
+
+            days = getattr(CONFIG, "auto_disconnect_days", 0)
+            hours = getattr(CONFIG, "auto_disconnect_hours", 0)
+            minutes = getattr(CONFIG, "auto_disconnect_minutes", 0)
+            
+            timeout = (days * 86400) + (hours * 3600) + (minutes * 60)
+            if timeout <= 0:
+                continue
+                
+            now = time.time()
+            
+            mode = getattr(CONFIG, "auto_disconnect_mode", "Absolute")
+            for vc in VIRTUAL_CONTROLLERS:
+                if vc is not None and getattr(vc, 'running', False):
+                    should_disconnect = False
+                    for c in vc.controllers:
+                        if mode == "Inactive":
+                            last_input = getattr(c, 'last_input_time', None)
+                            if last_input is not None and (now - last_input) >= timeout:
+                                should_disconnect = True
+                                break
+                        else: # Absolute
+                            connected_at = getattr(c, 'connected_at', None)
+                            if connected_at is not None and (now - connected_at) >= timeout:
+                                should_disconnect = True
+                                break
+                    if should_disconnect:
+                        if mode == "Inactive":
+                            logger.info(f"Auto Disconnect: Player {vc.player_number} inactivity duration exceeded limit. Disconnecting...")
+                            vc.trigger_disconnect()
+                        else:
+                            logger.info(f"Auto Disconnect: Player {vc.player_number} connection duration exceeded limit. Disconnecting...")
+                            vc.trigger_disconnect()
+        except Exception as e:
+            logger.error(f"Error in auto_disconnect_checker: {e}")
+
+async def run_discovery_session(update_controllers_threadsafe, quit_event, startup_bridge_context=None):
+    """Own the wired and wireless discovery routes as two independent tasks.
+
+    The wired watcher used to be created by (and torn down with) run_discovery(). That
+    coupling meant any way the wireless route ended -- a return, an exception, or simply
+    giving up on an absent Bluetooth adapter -- also cancelled the wired watcher and
+    disconnected wired controllers that were working perfectly well. Ownership lives here
+    instead, so the wired route survives whatever the wireless route does.
+    """
+    global VIRTUAL_CONTROLLERS, UPDATE_CALLBACK, DISCOVERER_LOOP, _CURRENTLY_DISCOVERING
+    global GLOBAL_LOCK, CONNECTION_LOCK, BLUETOOTH_RADIO_EVENT
+
+    with DISCOVERY_LOCK:
+        if _CURRENTLY_DISCOVERING:
+            logger.warning("Discovery already running. Skipping...")
+            return
+        _CURRENTLY_DISCOVERING = True
+
+    usb_hid_task = None
+    try:
+        # These must exist before either route starts: run_usb_hid_discovery() uses
+        # GLOBAL_LOCK and UPDATE_CALLBACK from its very first scan.
+        UPDATE_CALLBACK = update_controllers_threadsafe
+        DISCOVERER_LOOP = asyncio.get_running_loop()
+        GLOBAL_LOCK = asyncio.Lock()
+        CONNECTION_LOCK = asyncio.Lock()
+        BLUETOOTH_RADIO_EVENT = asyncio.Event()
+
+        logger.info("Discovery starting: Performing initial cleanup of stale controllers...")
+        for i, vc in enumerate(VIRTUAL_CONTROLLERS):
+            if vc is not None:
+                try:
+                    # Force disconnect and destruction of virtual device
+                    await vc.disconnect(is_suspending=False)
+                except Exception as e:
+                    logger.error(f"Error in initial cleanup of controller {i}: {e}")
+                VIRTUAL_CONTROLLERS[i] = None
+
+        # Detach all possible USBIP ports to clear stale attachments
+        try:
+            from virtual_controller import detach_all_usbip_devices
+            detach_all_usbip_devices()
+        except Exception as e:
+            logger.error(f"Error in initial USBIP port cleanup: {e}")
+
+        if UPDATE_CALLBACK:
+            UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+
+        # Wired USB controllers (e.g. Pro Controller 2) run on an independent transport.
+        usb_hid_task = asyncio.create_task(run_usb_hid_discovery(quit_event))
+
+        try:
+            await run_discovery(quit_event, startup_bridge_context)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A wireless-route failure must never take the wired route with it.
+            logger.exception("Wireless discovery route failed; wired route continues")
+            while not quit_event.is_set():
+                await asyncio.sleep(0.5)
+    finally:
+        if usb_hid_task is not None:
+            usb_hid_task.cancel()
+            try:
+                await usb_hid_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug("USB HID discovery task teardown error", exc_info=True)
+        with DISCOVERY_LOCK:
+            _CURRENTLY_DISCOVERING = False
+        logger.info(f"[{time.strftime('%H:%M:%S')}] Discovery loop exited. Starting session cleanup...")
+        # Use a copy to avoid issues if the list is modified during iteration
+        vcs_to_disconnect = [vc for vc in VIRTUAL_CONTROLLERS if vc is not None]
+        if vcs_to_disconnect:
+            # CRITICAL: We now use is_suspending=False even during suspend
+            # to ensure the ViGEmBus handles are closed cleanly.
+            # Our "Triple Protection" in gui.py handles the wake-prevention.
+            await asyncio.gather(*[vc.disconnect(is_suspending=False) for vc in vcs_to_disconnect])
+        logger.info(f"[{time.strftime('%H:%M:%S')}] Discovery session cleanup complete.")
+        # Allow WinRT background events (like services_changed_handler) to clear out before closing the loop
+        await asyncio.sleep(0.5)
+
+
+async def run_discovery(quit_event, startup_bridge_context=None):
+    """The wireless route: ESP32-S3 bridge if present, otherwise system Bluetooth.
+
+    Owns neither the wired watcher nor the session-wide cleanup -- see
+    run_discovery_session() above.
+    """
+    global VIRTUAL_CONTROLLERS, DISCONNECT_CALLBACK, _SYSTEM_BT_AVAILABLE
+
+    connected_mac_addresses: list[str] = []
+
+    try:
+        try:
+            import usb_serial_bridge as _usb_serial_bridge_mod
+            from usb_serial_bridge import (
+                detect_bridge,
+                create_esp32s3_controller,
+                ESP32S3Controller,
+                ESP32S3SerialClient,
+                ESP32S3_LABEL,
+                MAX_ESP32S3_CHANNELS,
+                MAX_ESP32S3_GROUPS,
+            )
+
+            def publish_bridge_scan_state(active: bool):
+                """Publish bridge runtime readiness without probing the COM port again."""
+                active = bool(active)
+                if _usb_serial_bridge_mod.BRIDGE_SCAN_ACTIVE == active:
+                    return
+                _usb_serial_bridge_mod.BRIDGE_SCAN_ACTIVE = active
+                callback = UPDATE_CALLBACK
+                if callback is not None:
+                    try:
+                        callback(list(VIRTUAL_CONTROLLERS))
+                    except Exception:
+                        logger.debug("Failed to publish ESP32-S3 bridge state change", exc_info=True)
+
+            bootstrap_status = (startup_bridge_context or {}).get("status")
+            bootstrap_age = time.monotonic() - float((startup_bridge_context or {}).get("observed_mono", 0.0))
+            use_bootstrap_bridge = bool(
+                bootstrap_status
+                and bootstrap_age <= 3.0
+                and getattr(bootstrap_status, "serial_port", None)
+                and getattr(bootstrap_status, "firmware_current", False)
+                and getattr(bootstrap_status, "bridge_ready", False)
+            )
+            if use_bootstrap_bridge:
+                bridge = bootstrap_status
+            else:
+                bridge = detect_bridge()
+        except Exception as e:
+            bridge = None
+            logger.debug(f"ESP32-S3 bridge detection failed: {e}")
+
+        logger.info(
+            "Controller connection route check: ESP32-S3 present=%s firmware_current=%s transport_ready=%s version=%s serial=%s usb=%s",
+            bool(bridge and bridge.board_present),
+            bool(bridge and bridge.firmware_current),
+            bool(bridge and getattr(bridge, "bridge_ready", False)),
+            getattr(bridge, "firmware_version", "") if bridge else "",
+            getattr(getattr(bridge, "serial_port", None), "port", "") if bridge else "",
+            bool(bridge and getattr(bridge, "usb_present", False)),
+        )
+
+        if bridge and bridge.firmware_current and not getattr(bridge, "bridge_ready", False) and not getattr(bridge, "otg_only", False):
+            logger.info(f"{ESP32S3_LABEL} firmware is installed, waiting for USB CDC transport before using system bluetooth.")
+            for attempt in range(24):
+                if quit_event.is_set():
+                    break
+                await asyncio.sleep(0.5)
+                try:
+                    bridge = detect_bridge()
+                except Exception as e:
+                    bridge = None
+                    logger.debug(f"ESP32-S3 bridge retry detection failed: {e}")
+                if bridge and getattr(bridge, "bridge_ready", False):
+                    logger.info(f"{ESP32S3_LABEL} USB CDC transport became ready after {(attempt + 1) * 0.5:.1f}s.")
+                    break
+            if bridge and not getattr(bridge, "bridge_ready", False):
+                logger.warning(
+                    "%s firmware is installed but USB CDC transport is not ready. Falling back to system bluetooth.",
+                    ESP32S3_LABEL,
+                )
+
+        if bridge and getattr(bridge, "bridge_ready", False) and bridge.serial_port:
+            logger.info(f"Controller connection route: ESP32-S3 USB CDC ({ESP32S3_LABEL})")
+            fallback_to_system_bluetooth = False
+        
+            while not quit_event.is_set():
+                checker_task = None
+                shared_client = None
+                worker_task = None
+                try:
+                    current_bridge = None
+                    if not use_bootstrap_bridge:
+                        try:
+                            current_bridge = detect_bridge()
+                        except Exception as e:
+                            logger.debug("ESP32-S3 bridge redetection failed before route start: %s", e)
+
+                    # The bridge was already positively identified before
+                    # entering this route. During OTG reconnects, a second
+                    # status probe can briefly miss the JSON reply even though
+                    # the COM transport is usable. Keep the known-good port
+                    # unless the port disappears entirely.
+                    if current_bridge and current_bridge.serial_port:
+                        if getattr(current_bridge, "bridge_ready", False):
+                            bridge = current_bridge
+                        elif getattr(bridge, "serial_port", None) and current_bridge.serial_port.port == bridge.serial_port.port:
+                            logger.debug(
+                                "%s status not ready on redetection; keeping known port %s.",
+                                ESP32S3_LABEL,
+                                bridge.serial_port.port,
+                            )
+                        else:
+                            bridge = current_bridge
+                    elif not getattr(bridge, "serial_port", None):
+                        logger.info("%s USB CDC transport is no longer available. Falling back to system bluetooth.", ESP32S3_LABEL)
+                        fallback_to_system_bluetooth = True
+                        break
+
+                    shared_client = ESP32S3SerialClient(bridge.serial_port.port)
+                    try:
+                        open_success = False
+                        for _ in range(5):
+                            try:
+                                shared_client.open(fast=use_bootstrap_bridge)
+                                open_success = True
+                                break
+                            except PermissionError:
+                                time.sleep(0.5)
+                        if not open_success:
+                            shared_client.open(fast=use_bootstrap_bridge) # Try one last time to throw the exception if still failing
+                    except OSError as e:
+                        logger.warning(
+                            "%s USB CDC transport could not be opened: %s. Falling back to system bluetooth.",
+                            ESP32S3_LABEL,
+                            e,
+                        )
+                        fallback_to_system_bluetooth = True
+                        break
+                    checker_task = asyncio.create_task(auto_disconnect_checker(quit_event))
+
+                    async def esp32_disconnected_controller(controller: Controller):
+                        ch = getattr(controller, 'channel', None)
+                        logger.info(f"{ESP32S3_LABEL} disconnected channel={ch}")
+
+                        # Issue 3: actively tell the firmware to drop this channel's BLE
+                        # link. The callback fires both when the firmware already lost the
+                        # link (no-op on the firmware side) and when the main program
+                        # decides to disconnect (user removal / auto-disconnect / shutdown).
+                        # Sending "disc <ch>" is safe either way and frees the firmware
+                        # channel so the controller can be re-detected later (issue 4).
+                        if ch is not None and shared_client is not None:
+                            try:
+                                await asyncio.to_thread(
+                                    shared_client.send_fire_and_forget, f"disc {ch}"
+                                )
+                            except Exception:
+                                logger.debug("Failed to send disc for channel %s", ch, exc_info=True)
+                            # Resume scanning so the controller can re-advertise and be
+                            # detected again. disc alone does not restart the scan.
+                            try:
+                                await asyncio.to_thread(
+                                    shared_client.send_fire_and_forget, "scan on"
+                                )
+                            except Exception:
+                                pass
+
+                        # Clear all tracking state so the same controller can advertise,
+                        # be detected and reconnect cleanly (issue 4). Clear by BOTH the
+                        # controller_info MAC and the device.address — a stale entry left
+                        # in connected_mac_addresses makes the scan_result filter drop the
+                        # controller's reconnect ads forever ("can't search after close").
+                        if ch is not None:
+                            controllers_by_channel.pop(ch, None)
+                            missing_counts_by_channel.pop(ch, None)
+                        macs_to_clear = set()
+                        ci_mac = getattr(getattr(controller, 'controller_info', None), 'mac_address', None)
+                        if ci_mac:
+                            macs_to_clear.add(ci_mac.upper())
+                        dev_mac = getattr(getattr(controller, 'device', None), 'address', None)
+                        if dev_mac:
+                            macs_to_clear.add(dev_mac.upper())
+                        for mac_u in macs_to_clear:
+                            while mac_u in connected_mac_addresses:
+                                connected_mac_addresses.remove(mac_u)
+                            bridge_connecting_macs.discard(mac_u)
+                            bridge_connecting_since.pop(mac_u, None)
+                            bridge_retry_counts.pop(mac_u, None)
+                            bridge_pending_pair.discard(mac_u)
+                        logger.info(
+                            "Bridge disconnect cleanup: ch=%s cleared=%s; still-connected=%s",
+                            ch, sorted(macs_to_clear), list(connected_mac_addresses),
+                        )
+
+                        async with GLOBAL_LOCK:
+                            for i, vc in enumerate(VIRTUAL_CONTROLLERS[:]):
+                                if vc is not None and controller in getattr(vc, "controllers", []):
+                                    # Mirror the WinRT path: only free the slot when
+                                    # remove_controller reports the group is now EMPTY
+                                    # (it returns True and tears down USBIP / detaches the
+                                    # virtual device then). For a merged group it returns
+                                    # False after stopping just this controller's USBIP and
+                                    # re-initing the rest — nulling the slot anyway would
+                                    # orphan the remaining controller's still-running USBIP
+                                    # server, leaving the virtual device stuck attached.
+                                    try:
+                                        became_empty = await vc.remove_controller(controller)
+                                    except Exception:
+                                        logger.exception("Failed to remove ESP32-S3 bridge controller")
+                                        became_empty = True
+                                    if became_empty:
+                                        VIRTUAL_CONTROLLERS[i] = None
+
+                            if IS_SHUTTING_DOWN or _IS_SUSPENDING:
+                                return
+
+                            reorder_controllers()
+
+                            if UPDATE_CALLBACK is not None:
+                                UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+
+                            await update_all_player_leds()
+
+                    DISCONNECT_CALLBACK = esp32_disconnected_controller
+
+                    bridge_connecting_macs = set()
+                    # MACs that have a BLE connection established at the firmware level but
+                    # whose PC-side init (add_esp32_channel / controller.initialize) is still
+                    # running. Counted in active_count so the status loop uses a generous
+                    # miss_limit during the init window instead of restarting after 4 misses.
+                    bridge_init_macs: set[str] = set()
+                    # Serializes ESP32 controller init sequences so that two controllers
+                    # connecting simultaneously don't flood the shared serial port with
+                    # competing SW2 init commands, causing response timeouts and failed
+                    # read_controller_info() → disconnect.
+                    esp32_init_lock = asyncio.Lock()
+                    # MAC → addr_type (0=public, 1=random), populated from scan_result events
+                    bridge_mac_addr_type: dict[str, int] = {}
+                    # MAC → retry count for y700-style fast-window reconnect
+                    bridge_retry_counts: dict[str, int] = {}
+                    # MAC → monotonic time we started connecting; used by the watchdog in
+                    # the status loop to clear stuck connects so a later scan_result retries.
+                    bridge_connecting_since: dict[str, float] = {}
+                    # MAC → monotonic time the PC-side init started; used by the watchdog
+                    # to abort inits that have been running too long (e.g. after a serial
+                    # port error leaves init commands timing out). 45 s matches 3 × the
+                    # SW2 consecutive-failure abort window so it only triggers if the fast
+                    # abort somehow didn't fire.
+                    bridge_init_since: dict[str, float] = {}
+                    # MACs that connected in pairing mode and must run the Switch 2
+                    # application-level pair() handshake (SET_MAC to the bridge) once
+                    # GATT is up, so the controller bonds to the bridge.
+                    bridge_pending_pair: set[str] = set()
+                    # The bridge's own BLE MAC (str + int), read from the firmware status.
+                    # Used as the host MAC in pair() and to recognise reconnect ads
+                    # addressed to this bridge.
+                    esp32_mac_str = None
+                    esp32_mac_value = None
+
+                    # Block controller connections until "scan on" is sent and the
+                    # bridge is fully armed. Cleared at session start so the GUI shows
+                    # "Initializing" instead of "Ready" during the setup window.
+                    publish_bridge_scan_state(False)
+
+                    def bridge_event_callback(event):
+                        try:
+                            cmd = event.get("cmd")
+
+                            if cmd in ("connected", "gatt_ready"):
+                                # Drop stale connections that arrive before the bridge is
+                                # fully armed (before "scan on"). The firmware may auto-
+                                # reconnect lingering links from the previous session
+                                # during the auto off / ble disconnect window.
+                                if not _usb_serial_bridge_mod.BRIDGE_SCAN_ACTIVE:
+                                    mac = (event.get("mac") or "").upper()
+                                    channel = int(event.get("channel", -1))
+                                    logger.info(
+                                        "ESP32 bridge not yet scanning; dropping early connected event "
+                                        "ch=%s mac=%s", channel, mac
+                                    )
+                                    if channel >= 0:
+                                        try:
+                                            shared_client.send_fire_and_forget(f"disc {channel}")
+                                        except Exception:
+                                            pass
+                                    return
+
+                                channel = int(event.get("channel", -1))
+                                mac = (event.get("mac") or "").upper()
+                                if channel < 0 or not mac:
+                                    return
+                                if mac not in connected_mac_addresses:
+                                    connected_mac_addresses.append(mac)
+                                bridge_connecting_macs.discard(mac)
+                                bridge_retry_counts.pop(mac, None)
+                                if DISCOVERER_LOOP and DISCOVERER_LOOP.is_running():
+                                    async def handle_connected(ch=channel, m=mac, ready_event=cmd):
+                                        if ch not in controllers_by_channel:
+                                            bridge_init_since.setdefault(m, time.time())
+                                            try:
+                                                # Firmware before 2.4 reports GCN connected when
+                                                # notify registration starts, before its input and
+                                                # ACK CCCDs finish draining. Preserve v1.1's settle
+                                                # only for that legacy ESP32 GameCube route.
+                                                if (ready_event == "connected"
+                                                        and shared_client.channel_is_gamecube(ch)
+                                                        and not shared_client.firmware_features.get("gatt_ready")):
+                                                    await asyncio.sleep(0.5)
+                                                ctrl = await add_esp32_channel(ch, m)
+                                                if ctrl is not None:
+                                                    controllers_by_channel[ch] = ctrl
+                                                    missing_counts_by_channel[ch] = 0
+                                            finally:
+                                                bridge_init_macs.discard(m)
+                                                bridge_init_since.pop(m, None)
+                                    if channel not in controllers_by_channel and mac not in bridge_init_macs:
+                                        # Reserve before scheduling: firmware v2 emits
+                                        # gatt_ready followed by legacy connected for
+                                        # compatibility, and both may arrive in one read.
+                                        bridge_init_macs.add(mac)
+                                        asyncio.run_coroutine_threadsafe(handle_connected(), DISCOVERER_LOOP)
+                                return
+
+                            if cmd == "connect_fail":
+                                # Firmware could not establish BLE connection to this MAC.
+                                # Clear connecting state so the next scan_result triggers a retry.
+                                mac = (event.get("mac") or "").upper()
+                                if not mac:
+                                    return
+                                retries = bridge_retry_counts.get(mac, 0)
+                                bridge_retry_counts[mac] = retries + 1
+                                # y700: fast reconnect window — retry up to 10 times then give up.
+                                if retries < 10 and DISCOVERER_LOOP and DISCOVERER_LOOP.is_running():
+                                    addr_type = bridge_mac_addr_type.get(mac, 0)
+                                    logger.info(
+                                        "Bridge connect_fail for %s (attempt %d/10); retrying in 800 ms",
+                                        mac, retries + 1,
+                                    )
+                                    async def _retry(m=mac, t=addr_type):
+                                        await asyncio.sleep(0.8)
+                                        bridge_connecting_macs.discard(m)
+                                        cmd_str = f"conn {t} {m}"
+                                        await asyncio.to_thread(
+                                            shared_client.send_fire_and_forget, cmd_str
+                                        )
+                                        bridge_connecting_macs.add(m)
+                                    asyncio.run_coroutine_threadsafe(_retry(), DISCOVERER_LOOP)
+                                else:
+                                    # Give up; let the controller advertise again naturally.
+                                    bridge_connecting_macs.discard(mac)
+                                    if retries >= 10:
+                                        bridge_retry_counts.pop(mac, None)
+                                        logger.warning(
+                                            "Bridge connect_fail for %s: gave up after 10 attempts", mac
+                                        )
+                                return
+
+                            if cmd == "connect_busy":
+                                # Firmware was already connecting when we sent conn; remove from
+                                # connecting set so we retry when the next scan_result arrives.
+                                mac = (event.get("mac") or "").upper()
+                                bridge_connecting_macs.discard(mac)
+                                return
+
+                            if cmd == "disconnected":
+                                # Firmware lost the BLE link for a channel.  Handle immediately
+                                # so the Python host tracks the disconnect in real time instead
+                                # of waiting for 3 consecutive missing-from-status polls.
+                                # This also prevents the "disconnected" JSON from poisoning the
+                                # send_manager_command("status lite") response queue, which
+                                # would return channel_mask=0 and falsely disconnect ALL channels.
+                                channel = int(event.get("channel", -1))
+                                if channel >= 0 and DISCOVERER_LOOP and DISCOVERER_LOOP.is_running():
+                                    async def handle_disconnected(ch=channel):
+                                        controller = controllers_by_channel.pop(ch, None)
+                                        missing_counts_by_channel.pop(ch, None)
+                                        if controller is not None:
+                                            await esp32_disconnected_controller(controller)
+                                    asyncio.run_coroutine_threadsafe(handle_disconnected(), DISCOVERER_LOOP)
+                                return
+
+                            if cmd == "scan_result":
+                                if not _usb_serial_bridge_mod.BRIDGE_SCAN_ACTIVE:
+                                    return
+
+                                mac = event.get("mac", "").upper()
+                                addr_type = int(event.get("type", 0))
+                                is_directed = bool(event.get("directed", 0))
+
+                                # Remember addr_type for later retry use.
+                                if mac:
+                                    bridge_mac_addr_type[mac] = addr_type
+
+                                # Filter already connecting / connected.
+                                if mac in bridge_connecting_macs or mac in connected_mac_addresses:
+                                    logger.debug(
+                                        "scan_result for %s filtered (connecting=%s connected=%s)",
+                                        mac, mac in bridge_connecting_macs, mac in connected_mac_addresses,
+                                    )
+                                    return
+
+                                if is_directed:
+                                    # Directed advertising is addressed to THIS bridge
+                                    # specifically: a controller that was connected to us and
+                                    # is trying to reconnect fast. The earlier filter already
+                                    # dropped MACs we're already connecting/connected to, so
+                                    # just connect — do NOT gate on calibration_data, which is
+                                    # keyed by MAC and would be empty for a controller that has
+                                    # not been gyro-calibrated yet, making reconnect impossible.
+                                    logger.info("Reconnecting (directed) to %s via bridge", mac)
+                                    bridge_connecting_macs.add(mac)
+                                    if DISCOVERER_LOOP and DISCOVERER_LOOP.is_running():
+                                        async def _conn_directed(m=mac, t=addr_type):
+                                            await asyncio.to_thread(
+                                                shared_client.send_fire_and_forget,
+                                                f"conn {t} {m}"
+                                            )
+                                        asyncio.run_coroutine_threadsafe(_conn_directed(), DISCOVERER_LOOP)
+                                    return
+
+                                # --- Undirected advertising: parse manufacturer data ---
+                                data_hex = event.get("data", "")
+                                if not data_hex:
+                                    return
+
+                                try:
+                                    raw_bytes = bytes.fromhex(data_hex)
+                                except ValueError:
+                                    return
+
+                                pos = 0
+                                nintendo_manufacturer_data = None
+                                while pos < len(raw_bytes):
+                                    ad_len = raw_bytes[pos]
+                                    if ad_len == 0 or pos + 1 + ad_len > len(raw_bytes):
+                                        break
+                                    ad_type = raw_bytes[pos + 1]
+                                    if ad_type == 0xFF and ad_len >= 3:
+                                        company_id = raw_bytes[pos + 2] | (raw_bytes[pos + 3] << 8)
+                                        if company_id == NINTENDO_BLUETOOTH_MANUFACTURER_ID:
+                                            nintendo_manufacturer_data = raw_bytes[pos + 4 : pos + 1 + ad_len]
+                                            break
+                                    pos += 1 + ad_len
+
+                                if not nintendo_manufacturer_data or len(nintendo_manufacturer_data) < 7:
+                                    return
+
+                                vendor_id = decodeu(nintendo_manufacturer_data[3:5])
+                                product_id = decodeu(nintendo_manufacturer_data[5:7])
+
+                                if vendor_id != NINTENDO_VENDOR_ID or product_id not in CONTROLER_NAMES:
+                                    return
+
+                                # Bytes 10..16 carry the MAC of the host this controller is
+                                # currently bonded to (0 = pairing mode / not bonded). This is
+                                # exactly how the WinRT path decides pair-vs-reconnect.
+                                reconnect_mac = (
+                                    decodeu(nintendo_manufacturer_data[10:16])
+                                    if len(nintendo_manufacturer_data) >= 16 else 0
+                                )
+
+                                # Ghost connection: controller advertising while we think it's connected.
+                                if mac in connected_mac_addresses:
+                                    logger.info(f"Ghost connection detected for {mac}. Clearing state and waiting for cleanup.")
+                                    try:
+                                        connected_mac_addresses.remove(mac)
+                                    except ValueError:
+                                        pass
+
+                                    bridge_connecting_macs.add(mac)
+                                    if DISCOVERER_LOOP and DISCOVERER_LOOP.is_running():
+                                        async def cleanup_ghost():
+                                            for ch, ctrl in list(controllers_by_channel.items()):
+                                                if getattr(ctrl.controller_info, 'mac_address', '').upper() == mac:
+                                                    await asyncio.to_thread(shared_client.send_fire_and_forget, f"disc {ch}")
+                                                    break
+                                            await asyncio.sleep(2.0)
+                                            bridge_connecting_macs.discard(mac)
+                                            logger.info(f"Ghost connection cleanup complete for {mac}. Ready for pairing.")
+                                        asyncio.run_coroutine_threadsafe(cleanup_ghost(), DISCOVERER_LOOP)
+                                    return
+
+                                # Decide pair vs reconnect vs ignore based on which host
+                                # the controller is bonded to (mirrors the WinRT path).
+                                if reconnect_mac == 0:
+                                    # Pairing mode (SYNC held / not bonded): connect AND run the
+                                    # Switch 2 pair() handshake so it bonds to THIS bridge.
+                                    logger.info(
+                                        "Found pairing device %s %s via bridge (will pair to bridge)",
+                                        CONTROLER_NAMES[product_id], mac,
+                                    )
+                                    bridge_pending_pair.add(mac)
+                                elif esp32_mac_value is not None and reconnect_mac == esp32_mac_value:
+                                    # Already bonded to this bridge — straight reconnect.
+                                    logger.info("Reconnecting to %s via bridge", mac)
+                                    bridge_pending_pair.discard(mac)
+                                elif esp32_mac_value is not None:
+                                    # Bonded to a DIFFERENT host (e.g. the PC). The controller
+                                    # would accept then drop our connection (disc 574). Don't
+                                    # fight it — the user must hold SYNC to re-bond to the bridge.
+                                    logger.info(
+                                        "Controller %s is paired to another host (reconnect_mac=%012X, bridge=%012X); "
+                                        "hold SYNC on the controller to pair it to the bridge.",
+                                        mac, reconnect_mac, esp32_mac_value,
+                                    )
+                                    return
+                                else:
+                                    # Bridge MAC unknown (older firmware): fall back to old behaviour.
+                                    logger.info("Reconnecting to %s via bridge", mac)
+
+                                bridge_connecting_macs.add(mac)
+                                # y700 approach: Python drives the connection explicitly so we can
+                                # retry on connect_fail with proper backoff.
+                                if DISCOVERER_LOOP and DISCOVERER_LOOP.is_running():
+                                    async def _conn_undirected(m=mac, t=addr_type):
+                                        await asyncio.to_thread(
+                                            shared_client.send_fire_and_forget,
+                                            f"conn {t} {m}"
+                                        )
+                                    asyncio.run_coroutine_threadsafe(_conn_undirected(), DISCOVERER_LOOP)
+
+                        except Exception as e:
+                            logger.exception("Exception in bridge_event_callback!")
+
+                    shared_client.event_callback = bridge_event_callback
+
+                    # Issue 5: arm the bridge for a fresh session. "auto off" hands
+                    # connection control to the main program; "ble disconnect" drops any
+                    # stale links left over from a previous unclean shutdown / crash so
+                    # the firmware channels start empty and controllers re-advertise and
+                    # reconnect cleanly; "scan on" starts reporting advertisements.
+                    await asyncio.to_thread(shared_client.send_fire_and_forget, "auto off")
+                    await asyncio.to_thread(shared_client.send_fire_and_forget, "ble disconnect")
+
+                    # Read the bridge's own BLE MAC so we can pair controllers to it
+                    # (Switch 2 SET_MAC handshake) and recognise reconnect ads aimed at us.
+                    try:
+                        from utils import convert_mac_string_to_value
+                        bootstrap_status_text = getattr(
+                            (startup_bridge_context or {}).get("status"), "status_text", ""
+                        ) if use_bootstrap_bridge else ""
+                        bootstrap_mac = ""
+                        if bootstrap_status_text:
+                            try:
+                                bootstrap_mac = (json.loads(bootstrap_status_text).get("mac") or "").strip().upper()
+                            except Exception:
+                                bootstrap_mac = ""
+                        if bootstrap_mac and bootstrap_mac != "00:00:00:00:00:00":
+                            esp32_mac_str = bootstrap_mac
+                            esp32_mac_value = convert_mac_string_to_value(bootstrap_mac)
+                            logger.info("ESP32-S3 bridge BLE MAC: %s (bootstrap)", esp32_mac_str)
+                        else:
+                            status_reply = await asyncio.to_thread(
+                                shared_client.send_manager_command, "status lite", timeout=1.0
+                            )
+                            if status_reply:
+                                s = json.loads(status_reply)
+                                m = (s.get("mac") or "").strip().upper()
+                                if m and m != "00:00:00:00:00:00":
+                                    esp32_mac_str = m
+                                    esp32_mac_value = convert_mac_string_to_value(m)
+                                    logger.info("ESP32-S3 bridge BLE MAC: %s", esp32_mac_str)
+                    except Exception:
+                        logger.debug("Could not read ESP32-S3 bridge BLE MAC", exc_info=True)
+                    if esp32_mac_value is None:
+                        logger.warning("ESP32-S3 bridge MAC unknown; controllers paired to another host won't reconnect until firmware reports its MAC.")
+
+                    await asyncio.to_thread(shared_client.send_fire_and_forget, "scan on")
+                    publish_bridge_scan_state(True)
+                    logger.info("ESP32-S3 Bridge is scanning. Monitoring up to %d physical channels / %d controller groups.",
+                                MAX_ESP32S3_CHANNELS,
+                                MAX_ESP32S3_GROUPS)
+
+                    controllers_by_channel = {}
+                    missing_counts_by_channel = {}
+                    last_wait_log = 0.0
+                    missed_status_count = 0
+
+                    async def add_esp32_channel(channel: int, mac: str = None):
+                        controller = ESP32S3Controller(bridge.serial_port.port, channel=channel, shared_client=shared_client)
+                        # The real BLE MAC is known up-front from the firmware's "connected"
+                        # event. Assign it as the controller's address BEFORE initialize()
+                        # so per-controller state (gyro/mag calibration, cemuhook pad MAC,
+                        # USBIP serial, paired-device detection) is keyed by the physical
+                        # MAC instead of the "ESP32-S3-N16R8-CHn" placeholder. Without this
+                        # bytes.fromhex(device.address) crashes the input callback and
+                        # paired controllers are never recognised for directed reconnect.
+                        if mac:
+                            mac = mac.upper()
+                            controller.device.address = mac
+                            try:
+                                controller.controller_info.mac_address = mac
+                            except Exception:
+                                pass
+                        controller.disconnected_callback = esp32_disconnected_controller
+                        async with esp32_init_lock:
+                            try:
+                                await controller.initialize()
+                            except Exception:
+                                logger.exception(
+                                    "ESP32 channel=%d init failed; clearing tracking so controller can advertise again",
+                                    channel,
+                                )
+                                # Do NOT send "disc <ch>" here — issuing disc on a BLE
+                                # channel that was already torn down by a serial error can
+                                # crash the firmware and disconnect ALL controllers.
+                                # The channel will free itself: either it is already gone
+                                # (serial error path) or the firmware will time it out.
+                                # Just wipe PC-side state so the next scan_result retries.
+                                controller.client = None
+                                mac_key = mac.upper() if mac else None
+                                if mac_key:
+                                    while mac_key in connected_mac_addresses:
+                                        connected_mac_addresses.remove(mac_key)
+                                    bridge_connecting_macs.discard(mac_key)
+                                    bridge_connecting_since.pop(mac_key, None)
+                                    bridge_retry_counts.pop(mac_key, None)
+                                return None
+
+                        # If this controller connected in pairing mode, run the Switch 2
+                        # application-level pair() handshake using the BRIDGE's MAC so the
+                        # controller bonds to the bridge and will reconnect to it on a
+                        # button press (mirrors the WinRT path's controller.pair()).
+                        if mac and mac.upper() in bridge_pending_pair:
+                            bridge_pending_pair.discard(mac.upper())
+                            if esp32_mac_value is not None:
+                                try:
+                                    await controller.pair(host_mac_value=esp32_mac_value)
+                                    logger.info("Paired %s to bridge (%s)", mac.upper(), esp32_mac_str)
+                                except Exception:
+                                    logger.exception("Failed to pair %s to bridge", mac.upper())
+                            else:
+                                logger.warning("Cannot pair %s to bridge: bridge MAC unknown.", mac.upper())
+
+                        # MAC is normally supplied by the connected event above; fall back to
+                        # controller_info if a caller invoked us without one.
+                        if not mac:
+                            wait_time = 0.0
+                            while not getattr(controller.controller_info, 'mac_address', None) and wait_time < 3.0:
+                                await asyncio.sleep(0.1)
+                                wait_time += 0.1
+                            mac = getattr(controller.controller_info, 'mac_address', None)
+                        if mac:
+                            mac = mac.upper()
+                            # initialize() replaced controller_info via read_controller_info(),
+                            # wiping the mac_address we set earlier. Restore it (and the
+                            # device address) so disconnect cleanup keyed on the MAC works —
+                            # otherwise a stale connected_mac_addresses entry makes the
+                            # controller's reconnect ads get filtered forever.
+                            controller.device.address = mac
+                            try:
+                                controller.controller_info.mac_address = mac
+                            except Exception:
+                                pass
+                            if mac not in connected_mac_addresses:
+                                connected_mac_addresses.append(mac)
+                            bridge_connecting_macs.discard(mac)
+                            bridge_connecting_since.pop(mac, None)
+
+                        # Issue 2: do NOT start the per-controller _poll_status here. It
+                        # disconnects on a single empty/timeout status reply, and when a
+                        # second controller connects its init sequence floods the shared
+                        # serial link — starving the first controller's status probe and
+                        # falsely disconnecting it. The single status loop below monitors
+                        # every channel with miss tolerance and is the only disconnect
+                        # detector for the bridge route.
+
+                        async with GLOBAL_LOCK:
+                            virtual_controller = None
+                            created_virtual_controller = False
+                            if CONFIG.combine_joycons and not controller.side_buttons_pressed:
+                                if controller.is_joycon_left():
+                                    virtual_controller = next(
+                                        filter(lambda vc: vc is not None and vc.is_single_joycon_right(), VIRTUAL_CONTROLLERS[:MAX_ESP32S3_GROUPS]),
+                                        None,
+                                    )
+                                elif controller.is_joycon_right():
+                                    virtual_controller = next(
+                                        filter(lambda vc: vc is not None and vc.is_single_joycon_left(), VIRTUAL_CONTROLLERS[:MAX_ESP32S3_GROUPS]),
+                                        None,
+                                    )
+
+                            if virtual_controller is None:
+                                free_slots = [i for i, c in enumerate(VIRTUAL_CONTROLLERS[:MAX_ESP32S3_GROUPS]) if c is None]
+                                if not free_slots:
+                                    logger.warning("ESP32-S3 channel=%d connected but max group limit reached (%d).", channel, MAX_ESP32S3_GROUPS)
+                                    await controller.disconnect()
+                                    return None
+                                slot_index = free_slots[0]
+                                virtual_controller = VirtualController(slot_index + 1, [controller], esp32_disconnected_controller, setup_usb=False)
+                                VIRTUAL_CONTROLLERS[slot_index] = virtual_controller
+                                created_virtual_controller = True
+                            else:
+                                virtual_controller.add_controller(controller)
+
+                            await virtual_controller.init_added_controller(controller)
+                            reorder_controllers()
+                            if UPDATE_CALLBACK is not None:
+                                UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+                            await update_all_player_leds()
+
+                        if created_virtual_controller:
+                            await asyncio.to_thread(virtual_controller.setup_virtual_device)
+                        async def _connection_haptics(c=controller):
+                            await c.trigger_connection_haptics()
+                        asyncio.create_task(_connection_haptics())
+                        logger.info("Controller connected via ESP32-S3 N16R8 channel=%d", channel)
+                        return controller
+
+                    while not quit_event.is_set():
+                        # Fast-detect hardware disconnect: the serial read loop sets
+                        # _closed_by_error on SerialException/OSError, which means the
+                        # physical USB link dropped. No point waiting for miss_limit
+                        # timeouts — restart the bridge loop immediately.
+                        if getattr(shared_client, '_closed_by_error', False):
+                            logger.warning(
+                                "ESP32-S3 serial port closed by hardware disconnect. Restarting bridge connection loop..."
+                            )
+                            break
+
+                        # Extend timeout when controllers are actively connecting, initializing,
+                        # or already connected — multiple simultaneous BLE handshakes and
+                        # SW2 init sequences can delay firmware responses significantly.
+                        status_timeout = 1.5 if (controllers_by_channel or bridge_connecting_macs or bridge_init_macs) else 0.5
+                        reply = await asyncio.to_thread(shared_client.send_manager_command, "status lite", timeout=status_timeout)
+                        if not reply:
+                            missed_status_count += 1
+                            # Allow more misses when controllers are in-flight — a busy BLE
+                            # stack can silence "status lite" for several seconds without the
+                            # bridge actually being gone. bridge_init_macs counts controllers
+                            # whose BLE is up but PC-side init hasn't finished yet.
+                            active_count = len(controllers_by_channel) + len(bridge_connecting_macs) + len(bridge_init_macs)
+                            miss_limit = 4 + active_count * 4
+                            if missed_status_count < miss_limit:
+                                logger.warning(
+                                    "%s status unavailable (%d/%d). Keeping USB CDC route.",
+                                    ESP32S3_LABEL,
+                                    missed_status_count,
+                                    miss_limit,
+                                )
+                                await asyncio.sleep(0.5)
+                                continue
+                            try:
+                                current_bridge = detect_bridge()
+                            except Exception:
+                                current_bridge = None
+                            if not current_bridge or not current_bridge.serial_port:
+                                logger.info("%s status unavailable and bridge is gone. Falling back to system bluetooth.", ESP32S3_LABEL)
+                                fallback_to_system_bluetooth = True
+                            else:
+                                logger.warning("ESP32-S3 status unavailable. Restarting bridge connection loop...")
+                            break
+                        missed_status_count = 0
+                        try:
+                            status = json.loads(reply)
+                        except Exception:
+                            status = {}
+                        channel_mask = int(status.get("ble_channels", 0) or 0)
+
+                        for channel in list(controllers_by_channel):
+                            if not (channel_mask & (1 << channel)):
+                                missing_counts_by_channel[channel] = missing_counts_by_channel.get(channel, 0) + 1
+                                if missing_counts_by_channel[channel] < 3:
+                                    logger.warning(
+                                        "ESP32-S3 channel=%d missing from status (%d/3); waiting before disconnect.",
+                                        channel,
+                                        missing_counts_by_channel[channel],
+                                    )
+                                    continue
+                                controller = controllers_by_channel.pop(channel)
+                                missing_counts_by_channel.pop(channel, None)
+                                mac = getattr(controller.controller_info, 'mac_address', None)
+                                if mac and mac.upper() in connected_mac_addresses:
+                                    connected_mac_addresses.remove(mac.upper())
+                                await esp32_disconnected_controller(controller)
+                            else:
+                                missing_counts_by_channel[channel] = 0
+
+                        # Issue 1 watchdog: a "conn" can be lost (controller stopped
+                        # advertising, firmware dropped the link during GATT discovery
+                        # without emitting connect_fail, etc.). Clear MACs that have been
+                        # "connecting" too long so the next scan_result triggers a fresh
+                        # connect attempt instead of staying stuck on "Found pairing device".
+                        now_mono = time.time()
+                        stuck_cleared = False
+                        for m in list(bridge_connecting_macs):
+                            started = bridge_connecting_since.get(m)
+                            if started is None:
+                                bridge_connecting_since[m] = now_mono
+                            elif now_mono - started > 12.0:
+                                logger.info(
+                                    "Bridge connect watchdog: clearing stuck connect for %s after %.0fs",
+                                    m, now_mono - started,
+                                )
+                                bridge_connecting_macs.discard(m)
+                                bridge_connecting_since.pop(m, None)
+                                bridge_retry_counts.pop(m, None)
+                                stuck_cleared = True
+                        for m in list(bridge_connecting_since):
+                            if m not in bridge_connecting_macs:
+                                bridge_connecting_since.pop(m, None)
+                        if stuck_cleared:
+                            # Abort the firmware's pending connect (without dropping any
+                            # already-connected channels) and make sure it is scanning,
+                            # so a connect that never completed cannot leave the bridge
+                            # unable to find any controller until it is replugged.
+                            try:
+                                await asyncio.to_thread(shared_client.send_fire_and_forget, "cancel")
+                                await asyncio.to_thread(shared_client.send_fire_and_forget, "scan on")
+                            except Exception:
+                                pass
+
+                        # Init watchdog: if a MAC has been in the PC-side init phase for
+                        # too long (serial error left SW2 init commands timing out), remove
+                        # it so the bridge is no longer counted in active_count and the
+                        # miss_limit is not inflated. The fast-abort in controller.py will
+                        # raise an exception first; this is a last-resort safety net.
+                        for m in list(bridge_init_macs):
+                            started = bridge_init_since.get(m)
+                            if started is None:
+                                bridge_init_since[m] = now_mono
+                            elif now_mono - started > 45.0:
+                                logger.warning(
+                                    "Bridge init watchdog: removing stuck init for %s after %.0fs; "
+                                    "bridge will remain able to find controllers.",
+                                    m, now_mono - started,
+                                )
+                                bridge_init_macs.discard(m)
+                                bridge_init_since.pop(m, None)
+                                while m in connected_mac_addresses:
+                                    connected_mac_addresses.remove(m)
+                                bridge_connecting_macs.discard(m)
+                        for m in list(bridge_init_since):
+                            if m not in bridge_init_macs:
+                                bridge_init_since.pop(m, None)
+
+                        await asyncio.sleep(0.5)
+
+                    checker_task.cancel()
+                    try:
+                        await checker_task
+                    except asyncio.CancelledError:
+                        pass
+
+                    # The bridge route is ending (USB unplugged, status lost, fallback,
+                    # or restart). Remove every controller still attached to it so it
+                    # does not linger as a ghost in the player slots. Without this,
+                    # unplugging the ESP32-S3 while a controller is connected leaves a
+                    # dead controller stuck in its slot. esp32_disconnected_controller
+                    # also frees the virtual device / USBIP server.
+                    for ghost in list(controllers_by_channel.values()):
+                        try:
+                            await esp32_disconnected_controller(ghost)
+                        except Exception:
+                            logger.exception("Failed to remove bridge controller during teardown")
+                    controllers_by_channel.clear()
+                    missing_counts_by_channel.clear()
+
+                    if shared_client:
+                        try:
+                            if ((fallback_to_system_bluetooth or quit_event.is_set())
+                                    and not (IS_SHUTTING_DOWN or _IS_SUSPENDING)):
+                                # Issue 5: bring the bridge to a fully idle state before we
+                                # let go of it — stop scanning, keep auto-connect disabled,
+                                # and drop every BLE link so no controller stays connected
+                                # once the main program stops working. The firmware will not
+                                # resume scanning on the resulting disconnect events because
+                                # scan_mode is now off. On the next app start the discoverer
+                                # re-arms the bridge with "auto off" + "scan on".
+                                await asyncio.to_thread(shared_client.send_fire_and_forget, "scan off")
+                                await asyncio.to_thread(shared_client.send_fire_and_forget, "auto off")
+                                await asyncio.to_thread(shared_client.send_fire_and_forget, "ble disconnect")
+                        except Exception:
+                            pass
+                        await shared_client.disconnect()
+
+                    publish_bridge_scan_state(False)
+
+                    if quit_event.is_set():
+                        return
+                    if fallback_to_system_bluetooth:
+                        break
+                    await asyncio.sleep(2.0)
+                    continue
+                except Exception:
+                    if worker_task:
+                        worker_task.cancel()
+                        try:
+                            await worker_task
+                        except asyncio.CancelledError:
+                            pass
+                    if checker_task:
+                        checker_task.cancel()
+                        try:
+                            await checker_task
+                        except asyncio.CancelledError:
+                            pass
+                    if shared_client:
+                        try:
+                            await shared_client.disconnect()
+                        except Exception:
+                            pass
+                    if not quit_event.is_set():
+                        logger.exception(f"{ESP32S3_LABEL} bridge connection failed. Retrying in 2 seconds...")
+                        await asyncio.sleep(2.0)
+                if not fallback_to_system_bluetooth:
+                    continue
+                logger.info("Controller connection route: ESP32-S3 unavailable, switching to system bluetooth")
+
+        host_mac_value = None
+        logger.info("Controller connection route: system bluetooth")
+        
+        from utils import get_local_mac_value, bluetooth_radio_present
+
+        # Runs for every wireless state below, including while waiting for a radio, so
+        # auto-disconnect keeps working for wired controllers on a machine with no radio.
+        checker_task = asyncio.create_task(auto_disconnect_checker(quit_event))
+
+        bluetooth_initialized = False
+        while not quit_event.is_set() and not bluetooth_initialized:
+            # Ask PnP whether a radio exists at all. get_local_mac_value() raises the same
+            # "No more data is available" for "no radio" and for "stack still starting",
+            # and retrying the former 15 times only delayed the wired route's status by
+            # 30 seconds while never being able to succeed.
+            if not await asyncio.to_thread(bluetooth_radio_present):
+                _SYSTEM_BT_AVAILABLE = False
+                if UPDATE_CALLBACK is not None:
+                    UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+                logger.info(
+                    "No Bluetooth radio present; skipping the BLE route. Wired controllers "
+                    "are unaffected. Waiting for a radio to appear.")
+                if not await _wait_for_bluetooth_radio(quit_event):
+                    return
+                continue
+
+            # A radio exists, so the stack may just still be warming up (this is normal
+            # right after boot) -- that is what these retries are for.
+            retries = 15
+            for attempt in range(retries):
+                if quit_event.is_set():
+                    logger.info("Quit event set during Bluetooth initialization.")
+                    return
+                try:
+                    # PyBluez's read_local_bdaddr() is a blocking call; keep it off the
+                    # shared event loop so it cannot stall the wired route.
+                    host_mac_value = await asyncio.to_thread(get_local_mac_value)
+                    # Test scanner initialization to verify WinRT stack is ready. Left on
+                    # the loop thread deliberately: WinRT objects are apartment-bound.
+                    scanner = BleakScanner()
+                    bluetooth_initialized = True
+                    logger.info(f"Bluetooth adapter and stack initialized successfully. Host MAC: {host_mac_value}")
+                    break
+                except Exception as e:
+                    # Flip the flag on the first failure, not after all the retries, so the
+                    # GUI header switches to the wired/USB view straight away.
+                    _SYSTEM_BT_AVAILABLE = False
+                    if attempt == 0 and UPDATE_CALLBACK is not None:
+                        UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+                    logger.warning(f"Waiting for Bluetooth adapter/stack initialization (attempt {attempt + 1}/{retries}): {e}")
+                    if not await asyncio.to_thread(bluetooth_radio_present):
+                        logger.info("Bluetooth radio went away while initializing; stopping retries.")
+                        break
+                    await asyncio.sleep(2.0)
+
+            if not bluetooth_initialized:
+                logger.error(
+                    "Bluetooth adapter/stack did not initialize. Wired controllers are "
+                    "unaffected. Waiting for the Bluetooth radio to change before retrying.")
+                _SYSTEM_BT_AVAILABLE = False
+                if not await _wait_for_bluetooth_radio(quit_event):
+                    return
+
+        if quit_event.is_set():
+            return
+        pending_connections_count = 0
+        sysbt_diag_states = {}
+        sysbt_diag_seen = {}
+        sysbt_diag_last_snapshot = 0.0
+
+        def sysbt_side(product_id):
+            name = str(CONTROLER_NAMES.get(product_id, "Controller"))
+            upper = name.upper()
+            if "LEFT" in upper or upper.endswith(" L"):
+                return "L"
+            if "RIGHT" in upper or upper.endswith(" R"):
+                return "R"
+            return name
+
+        def sysbt_stage(address, stage, advertised_pid=None, **extra):
+            if not _SYSTEM_BT_DIAGNOSTICS:
+                return
+            now = time.monotonic()
+            state = sysbt_diag_states.setdefault(address, {
+                "start": now, "stage_started": now, "stage": "created",
+                "side": sysbt_side(advertised_pid) if advertised_pid is not None else "unknown",
+            })
+            previous = state.get("stage")
+            elapsed = now - state["start"]
+            stage_elapsed = now - state.get("stage_started", now)
+            state.update(stage=stage, stage_started=now)
+            if advertised_pid is not None:
+                state["side"] = sysbt_side(advertised_pid)
+            details = " ".join(f"{key}={value}" for key, value in extra.items())
+            _sysbt_diag(
+                "device=%s side=%s stage=%s previous=%s stage_ms=%d total_ms=%d%s%s",
+                _sysbt_device_id(address), state["side"], stage, previous,
+                int(stage_elapsed * 1000), int(elapsed * 1000),
+                " " if details else "", details)
+
+        async def start_all_pending_virtual_usb():
+            logger.info("Initializing virtual USB/device setup for all pending controllers in parallel...")
+            tasks = []
+            for vc in VIRTUAL_CONTROLLERS:
+                if vc is not None:
+                    tasks.append(asyncio.to_thread(vc.setup_virtual_device))
+            if tasks:
+                await asyncio.gather(*tasks)
+
+        async def trigger_connection_haptics(controller):
+            if getattr(controller, "_connection_haptics_done", False):
+                return
+            controller._connection_haptics_done = True
+            await controller.trigger_connection_haptics()
+
+        async def disconnected_controller(controller: Controller):
+            address = (
+                getattr(getattr(controller, "device", None), "address", None)
+                or getattr(getattr(controller, "client", None), "address", None)
+                or getattr(controller, "address", None)
+            )
+            logger.info(f"Controller disconnected: {address}")
+            if address:
+                state = sysbt_diag_states.get(address, {})
+                _sysbt_diag(
+                    "device=%s side=%s event=disconnect stage=%s lifetime_ms=%d "
+                    "connected=%s connecting=%s",
+                    _sysbt_device_id(address), state.get("side", "unknown"),
+                    state.get("stage", "unknown"),
+                    int((time.monotonic() - state.get("start", time.monotonic())) * 1000),
+                    _sysbt_device_ids(connected_mac_addresses),
+                    _sysbt_device_ids(sorted(_connecting_macs)))
+            
+                if address in connected_mac_addresses:
+                    connected_mac_addresses.remove(address)
+                _connecting_macs.discard(address)
+            
+            async with GLOBAL_LOCK:
+                for i, vc in enumerate(VIRTUAL_CONTROLLERS[:]):
+                    if vc is not None:
+                        is_in_vc = controller in getattr(vc, "controllers", [])
+                        try:
+                            became_empty = await vc.remove_controller(controller)
+                        except Exception:
+                            logger.exception("Failed to remove controller from virtual controller")
+                            became_empty = True
+                        if became_empty or len(getattr(vc, "controllers", [])) == 0 or (is_in_vc and getattr(vc, "is_single", lambda: False)()):
+                            VIRTUAL_CONTROLLERS[i] = None
+        
+                if IS_SHUTTING_DOWN or _IS_SUSPENDING:
+                    return
+                
+                reorder_controllers()
+            
+                if UPDATE_CALLBACK is not None:
+                    UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+            
+                await update_all_player_leds()
+
+        DISCONNECT_CALLBACK = disconnected_controller
+
+        _connecting_macs: set[str] = set()
+
+        async def add_controller(device: BLEDevice, paired: bool, advertised_product_id=None):
+            nonlocal pending_connections_count
+            controller = None
+            peers_at_start = set(connected_mac_addresses)
+            stage = "task_created"
+            sysbt_stage(device.address, stage, advertised_product_id, paired=paired)
+            try:
+                controller = Controller(device, advertised_product_id=advertised_product_id,
+                                        paired_connection=paired)
+                if _SYSTEM_BT_DIAGNOSTICS:
+                    controller._system_bt_diag_callback = (
+                        lambda detail_stage, **detail: sysbt_stage(
+                            device.address, detail_stage, advertised_product_id, **detail))
+                # Serialize only native link establishment. Initialization uses
+                # this controller's independent GATT characteristics and may run
+                # while the peer starts connecting.
+                stage = "waiting_connection_lock"
+                sysbt_stage(device.address, stage, advertised_product_id,
+                            lock_waiters=len(_connecting_macs))
+                async with CONNECTION_LOCK:
+                    stage = "winrt_connect_started"
+                    sysbt_stage(device.address, stage, advertised_product_id)
+                    await controller.connect_ble()
+                    sysbt_stage(device.address, "winrt_connect_succeeded", advertised_product_id,
+                                is_connected=getattr(controller.client, "is_connected", False))
+                logger.info(f"Controller connected via system bluetooth: {device.address}")
+                controller.disconnected_callback = disconnected_controller
+
+                stage = "initialize_started"
+                sysbt_stage(device.address, stage, advertised_product_id)
+                await controller.initialize()
+                sysbt_stage(device.address, "initialize_succeeded", advertised_product_id,
+                            product_id=getattr(getattr(controller, "controller_info", None), "product_id", None))
+
+                if not paired:
+                    # Pairing changes shared Windows bonding/radio state and
+                    # therefore remains serialized.
+                    stage = "pair_started"
+                    sysbt_stage(device.address, stage, advertised_product_id)
+                    async with CONNECTION_LOCK:
+                        await controller.pair()
+                    sysbt_stage(device.address, "pair_completed", advertised_product_id)
+                    logger.info(f"Paired successfully to {device.address}")
+                # BLE connection confirmed -- promote to connected so scanner won't retry
+                _connecting_macs.discard(device.address)
+                connected_mac_addresses.append(device.address)
+                try:
+                    reconnect_val = reconnect_mac if (reconnect_mac and reconnect_mac != 0) else host_mac_value
+                    CONFIG.add_paired_controller(device.address, reconnect_mac=reconnect_val, name=CONTROLER_NAMES.get(advertised_product_id, "Controller"))
+                except Exception as e:
+                    logger.debug(f"Failed to record paired controller: {e}")
+            
+                # 4. Integrate the controller into VIRTUAL_CONTROLLERS under the global lock to prevent race conditions
+                async with GLOBAL_LOCK:
+                    stage = "merge_started"
+                    sysbt_stage(device.address, stage, advertised_product_id,
+                                combine=CONFIG.combine_joycons,
+                                side_buttons=controller.side_buttons_pressed)
+                    virtual_controller = None
+                    if CONFIG.combine_joycons and not controller.side_buttons_pressed:
+                        if controller.is_joycon_left():
+                            virtual_controller = next(filter(lambda vc: vc is not None and vc.is_single_joycon_right(), VIRTUAL_CONTROLLERS), None)
+                        elif controller.is_joycon_right():
+                            virtual_controller = next(filter(lambda vc: vc is not None and vc.is_single_joycon_left(), VIRTUAL_CONTROLLERS), None)
+
+                    if virtual_controller is None:
+                        slot_index = next(i for i, c in enumerate(VIRTUAL_CONTROLLERS) if c == None)
+                        virtual_controller = VirtualController(slot_index + 1, [controller], disconnected_controller, setup_usb=False)
+                        VIRTUAL_CONTROLLERS[slot_index] = virtual_controller
+                    else:
+                        virtual_controller.add_controller(controller)
+                    sysbt_stage(device.address, "merge_completed", advertised_product_id,
+                                player=virtual_controller.player_number,
+                                members=len(virtual_controller.controllers))
+                
+                    # LED writes are non-critical and used to run twice here
+                    # (init_added_controller + update_all_player_leds), delaying
+                    # virtual-device readiness by over 100 ms on WinRT.
+                    await virtual_controller.init_added_controller(controller, update_leds=False)
+
+                    # The first accepted WinRT input report arrives after the UI
+                    # has usually been created.  Queue a UI refresh when that
+                    # report supplies the first valid battery state, without
+                    # making the connection path wait for it.
+                    def refresh_battery_ui(changed_controller, _state):
+                        if (changed_controller is not controller
+                                or changed_controller not in virtual_controller.controllers):
+                            return
+                        callback = UPDATE_CALLBACK
+                        if callback is not None:
+                            callback(list(VIRTUAL_CONTROLLERS))
+                    controller.set_battery_state_callback(refresh_battery_ui)
+                 
+                    reorder_controllers()
+                
+                    if UPDATE_CALLBACK is not None:
+                        UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+                
+                    logger.info(VIRTUAL_CONTROLLERS)
+                
+                    pending_connections_count = max(0, pending_connections_count - 1)
+                    logger.info(f"Controller {device.address} connected. Remaining pending connections: {pending_connections_count}")
+                # A controller must become usable as soon as its own input path is
+                # initialized.  Do not make it wait for another pending BLE attempt
+                # (which may still be in WinRT's 20-second connect timeout).
+                stage = "virtual_device_setup_started"
+                sysbt_stage(device.address, stage, advertised_product_id)
+                await asyncio.to_thread(virtual_controller.setup_virtual_device)
+                sysbt_stage(device.address, "virtual_device_ready", advertised_product_id)
+                async def _refresh_leds_after_virtual_ready():
+                    try:
+                        await update_all_player_leds()
+                    except Exception as e:
+                        logger.debug(f"Deferred player LED refresh failed: {e}")
+                asyncio.create_task(_refresh_leds_after_virtual_ready())
+                asyncio.create_task(trigger_connection_haptics(controller))
+            except Exception as error:
+                peer_dropped = bool(peers_at_start - set(connected_mac_addresses))
+                classification = _sysbt_error_class(stage, error, peer_dropped=peer_dropped)
+                hresult = getattr(error, "hresult", getattr(error, "winerror", ""))
+                _sysbt_diag(
+                    "device=%s side=%s result=failed stage=%s classification=%s "
+                    "exception=%s hresult=%s connected=%s connecting=%s pending=%d",
+                    _sysbt_device_id(device.address), sysbt_side(advertised_product_id),
+                    stage, classification, f"{type(error).__name__}: {error}", hresult,
+                    _sysbt_device_ids(connected_mac_addresses),
+                    _sysbt_device_ids(sorted(_connecting_macs)),
+                    pending_connections_count)
+                logger.exception(f"Unable to initialize device {device.address}")
+                if device.address in connected_mac_addresses:
+                    connected_mac_addresses.remove(device.address)
+                _connecting_macs.discard(device.address)
+                async with GLOBAL_LOCK:
+                    pending_connections_count = max(0, pending_connections_count - 1)
+                    logger.info(f"Connection failed for {device.address}. Remaining pending connections: {pending_connections_count}")
+                if controller is not None:
+                    try:
+                        await controller.disconnect()
+                    except Exception:
+                        pass
+                print("\nConnection failed. Please press a button on the controller or hold SYNC to re-pair.")
+        
+            finally:
+                _connecting_macs.discard(device.address)
+
+        async def callback(device: BLEDevice, advertising_data: AdvertisementData):
+            nonlocal pending_connections_count
+            nintendo_manufacturer_data = advertising_data.manufacturer_data.get(NINTENDO_BLUETOOTH_MANUFACTURER_ID)
+            if nintendo_manufacturer_data:
+                logger.info(f"Received Nintendo BLE advertisement from {device.address}: len={len(nintendo_manufacturer_data)}")
+                if len(nintendo_manufacturer_data) < 16:
+                    _sysbt_diag("device=%s decision=ignored_malformed_advertisement length=%d",
+                                _sysbt_device_id(device.address), len(nintendo_manufacturer_data),
+                                rate_key=(device.address, "malformed"), rate_seconds=5.0)
+                    return
+                vendor_id = decodeu(nintendo_manufacturer_data[3:5])
+                product_id = decodeu(nintendo_manufacturer_data[5:7])
+                reconnect_mac = decodeu(nintendo_manufacturer_data[10:16])
+                if vendor_id == NINTENDO_VENDOR_ID and product_id in CONTROLER_NAMES:
+                    side = sysbt_side(product_id)
+                    sysbt_diag_seen[side] = time.monotonic()
+                    if full_capacity_reached():
+                        _sysbt_diag(
+                            "device=%s side=%s decision=ignored_capacity power_mode=%s",
+                            _sysbt_device_id(device.address), side, power_saving.mode(),
+                            rate_key=(device.address, "capacity"), rate_seconds=5.0)
+                        return
+                    if device.address in connected_mac_addresses:
+                        _sysbt_diag(
+                            "device=%s side=%s decision=ignored_already_connected",
+                            _sysbt_device_id(device.address), side,
+                            rate_key=(device.address, "connected"), rate_seconds=5.0)
+                        return
+                    if device.address in _connecting_macs:
+                        _sysbt_diag(
+                            "device=%s side=%s decision=ignored_already_connecting stage=%s",
+                            _sysbt_device_id(device.address), side,
+                            sysbt_diag_states.get(device.address, {}).get("stage", "queued"),
+                            rate_key=(device.address, "connecting"), rate_seconds=5.0)
+                        return
+                    logger.debug(f"Manufacturer data: {to_hex(nintendo_manufacturer_data)}")
+                    is_known_paired = device.address.upper() in CONFIG.get_paired_controller_macs()
+                    stored_reconnect = CONFIG.get_paired_controller_reconnect_mac(device.address)
+
+                    host_mac_matches = False
+                    if host_mac_value is not None and reconnect_mac != 0:
+                        if reconnect_mac == host_mac_value:
+                            host_mac_matches = True
+                        else:
+                            try:
+                                host_bytes = host_mac_value.to_bytes(6, 'little')
+                                if reconnect_mac == int.from_bytes(host_bytes, 'big'):
+                                    host_mac_matches = True
+                            except Exception:
+                                pass
+
+                    if reconnect_mac == 0:
+                        _sysbt_diag("device=%s side=%s decision=connect_pairing reconnect=zero",
+                                    _sysbt_device_id(device.address), side)
+                        logger.info(f"Found pairing device {CONTROLER_NAMES[product_id]} {device.address}")
+                        _connecting_macs.add(device.address)
+                        async with GLOBAL_LOCK:
+                            pending_connections_count += 1
+                        asyncio.create_task(add_controller(device, False, product_id))
+                    elif is_known_paired:
+                        paired_to_another = (
+                            stored_reconnect is not None
+                            and reconnect_mac != stored_reconnect
+                            and not host_mac_matches
+                        )
+                        if paired_to_another:
+                            _sysbt_diag(
+                                "device=%s side=%s decision=ignored_paired_to_different_host "
+                                "classification=PAIRED_TO_DIFFERENT_HOST reconnect=other stored=%s current=%s",
+                                _sysbt_device_id(device.address), side,
+                                stored_reconnect, reconnect_mac,
+                                rate_key=(device.address, "other_host"), rate_seconds=5.0)
+                        else:
+                            _sysbt_diag("device=%s side=%s decision=connect_paired reconnect=known_device",
+                                        _sysbt_device_id(device.address), side)
+                            logger.info(f"Found previously connected controller {CONTROLER_NAMES[product_id]} {device.address}, reconnecting...")
+                            if stored_reconnect is None and reconnect_mac != 0:
+                                try:
+                                    CONFIG.add_paired_controller(device.address, reconnect_mac=reconnect_mac, name=CONTROLER_NAMES.get(product_id, "Controller"))
+                                except Exception:
+                                    pass
+                            _connecting_macs.add(device.address)
+                            async with GLOBAL_LOCK:
+                                pending_connections_count += 1
+                            asyncio.create_task(add_controller(device, True, product_id))
+                    elif host_mac_matches:
+                        _sysbt_diag("device=%s side=%s decision=connect_paired reconnect=local",
+                                    _sysbt_device_id(device.address), side)
+                        logger.info(f"Found already paired device {CONTROLER_NAMES[product_id]} {device.address}")
+                        try:
+                            CONFIG.add_paired_controller(device.address, reconnect_mac=reconnect_mac, name=CONTROLER_NAMES.get(product_id, "Controller"))
+                        except Exception:
+                            pass
+                        _connecting_macs.add(device.address)
+                        async with GLOBAL_LOCK:
+                            pending_connections_count += 1
+                        asyncio.create_task(add_controller(device, True, product_id))
+                    else:
+                        logger.info(f"Ignored device {device.address}: reconnect_mac={reconnect_mac} host_mac={host_mac_value} is_known_paired={is_known_paired} stored_reconnect={stored_reconnect}")
+                        _sysbt_diag(
+                            "device=%s side=%s decision=ignored_paired_to_different_host "
+                            "classification=PAIRED_TO_DIFFERENT_HOST reconnect=other local_match=false",
+                            _sysbt_device_id(device.address), side,
+                            rate_key=(device.address, "other_host"), rate_seconds=5.0)
+
+        def full_capacity_reached():
+            controllers = [c for vc in VIRTUAL_CONTROLLERS
+                           for c in (getattr(vc, "controllers", ()) or ())]
+            return power_saving.full_scan_capacity_reached(controllers)
+
+        while not quit_event.is_set():
+            if full_capacity_reached():
+                await asyncio.sleep(1.0)
+                continue
+            try:
+                async with BleakScanner(callback) as scanner:
+                    _SYSTEM_BT_AVAILABLE = True
+                    _sysbt_diag(
+                        "scanner=started combine_joycons=%s power_mode=%s "
+                        "cached_services=%s",
+                        CONFIG.combine_joycons, power_saving.mode(),
+                        getattr(CONFIG, "winrt_cached_services", True))
+                    logger.info("BLE Scanner active: listening for controller advertisements (press a button or hold SYNC)...")
+                    print("Press a button on a paired controller, or hold sync button on an unpaired controller", flush=True)
+                    while not quit_event.is_set():
+                        await asyncio.sleep(1.0)
+                        if (_SYSTEM_BT_DIAGNOSTICS
+                                and time.monotonic() - sysbt_diag_last_snapshot >= 5.0
+                                and (connected_mac_addresses or _connecting_macs)):
+                            sysbt_diag_last_snapshot = time.monotonic()
+                            active = {
+                                _sysbt_device_id(address): state.get("stage", "unknown")
+                                for address, state in sysbt_diag_states.items()
+                                if address in _connecting_macs or address in connected_mac_addresses
+                            }
+                            seen_age = {
+                                side: round(sysbt_diag_last_snapshot - seen, 1)
+                                for side, seen in sysbt_diag_seen.items()
+                            }
+                            watcher_status = "unknown"
+                            if hasattr(scanner, '_backend') and hasattr(scanner._backend, 'watcher'):
+                                watcher_status = getattr(scanner._backend.watcher, 'status', "unknown")
+                            _sysbt_diag(
+                                "snapshot scanner=%s connected=%s connecting=%s pending=%d "
+                                "stages=%s last_advertisement_age_s=%s",
+                                watcher_status, _sysbt_device_ids(connected_mac_addresses),
+                                _sysbt_device_ids(sorted(_connecting_macs)), pending_connections_count,
+                                active, seen_age)
+                        if full_capacity_reached():
+                            logger.info("Full power-saving capacity reached; pausing automatic BLE scan")
+                            break
+                        # On Windows, check if the watcher was aborted (e.g. Bluetooth turned off)
+                        if hasattr(scanner, '_backend') and hasattr(scanner._backend, 'watcher'):
+                            status = getattr(scanner._backend.watcher, 'status', None)
+                            if status is not None and hasattr(status, 'value'):
+                                if status.value == 4: # BluetoothLEAdvertisementWatcherStatus.Aborted
+                                    logger.warning("Bluetooth watcher aborted (likely Bluetooth turned off). Restarting scanner...")
+                                    _SYSTEM_BT_AVAILABLE = False
+                                    break
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                _SYSTEM_BT_AVAILABLE = False
+                if UPDATE_CALLBACK is not None:
+                    UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+                # If the radio is simply gone (dongle unplugged mid-session) there is
+                # nothing to retry against, so wait for it to come back instead of logging
+                # an error every 2 seconds for the rest of the session.
+                if not await asyncio.to_thread(bluetooth_radio_present):
+                    logger.info(
+                        "Bluetooth radio removed; pausing the BLE route until one returns. "
+                        "Wired controllers are unaffected.")
+                    if not await _wait_for_bluetooth_radio(quit_event):
+                        return
+                    continue
+                logger.error(f"Bluetooth scanner error: {e}. Retrying in 2 seconds...")
+                await asyncio.sleep(2.0)
+    finally:
+        # Wireless-route cleanup only. Cancelling the wired watcher and disconnecting the
+        # controllers belongs to run_discovery_session(), which owns them -- doing it here
+        # is what used to kill working wired pads whenever this route ended.
+        _SYSTEM_BT_AVAILABLE = False
+        logger.info(f"[{time.strftime('%H:%M:%S')}] Wireless discovery route exited.")
+
+async def run_usb_hid_discovery(quit_event):
+    """Concurrent watcher for wired USB Pro Controller 2 devices.
+
+    Polls hidapi for the controller, hides its physical HID via HidHide, drives it
+    through the shared Controller pipeline, and occupies a normal player slot. Always
+    runs in the background alongside whichever BLE route ``run_discovery`` is using.
+    """
+    global WIRED_RESCAN_EVENT
+    WIRED_RESCAN_EVENT = asyncio.Event()
+    with WIRED_RESCAN_LOCK:
+        if getattr(CONFIG, "wired_auto_scan_enabled", getattr(CONFIG, "wired_usb_enabled", True)):
+            WIRED_RESCAN_REQUESTS.append(("startup", None, False))
+        if WIRED_RESCAN_REQUESTS:
+            WIRED_RESCAN_EVENT.set()
+
+    try:
+        from usb_hid_controller import (
+            USBHidController, enumerate_wired_controllers, WIRED_USB_PIDS)
+        import hidhide
+    except Exception as e:
+        logger.info("Wired USB support unavailable (missing hidapi?): %s", e)
+        return
+    logger.info("Wired USB watcher started (event-driven, VID 057E, PIDs %s).",
+                ", ".join(f"{pid:04X}" for pid in WIRED_USB_PIDS))
+
+    known: dict = {}          # device key -> USBHidController
+    # device key -> time.monotonic() when the _add task started. Timestamped (rather than a
+    # plain set) so a task that wedged or died without unwinding can be swept, instead of
+    # blocking that key from ever being re-added.
+    connecting: dict = {}
+    removing: set = set()
+    arrival_retry_tasks: dict = {}
+    # Every physical HID instance we've added to the HidHide blacklist. Entries persist
+    # across unplug/replug so a reconnecting controller stays hidden the instant it
+    # reappears (never briefly visible to third-party software). Cleared only on teardown.
+    hidden_instances: set = set()
+
+    def _device_key(entry):
+        # The HID path is unique per physical device/port; Nintendo serials are all '00'.
+        path = entry.get("path")
+        if path is not None:
+            return path if isinstance(path, str) else bytes(path)
+        return (entry.get("serial_number") or "").strip().upper()
+
+    def _controller_transport_dead(controller):
+        client = getattr(controller, "client", None)
+        if client is None:
+            return True
+        if not getattr(client, "is_connected", False):
+            return True
+        read_thread = getattr(client, "_read_thread", None)
+        if read_thread is not None and not read_thread.is_alive():
+            return True
+        # Second line of defence for a silently stalled pad. The client has its own
+        # staleness watchdog; this only catches the case where that failed to fire,
+        # so the window is a generous multiple of the client's timeout and never
+        # races an in-progress recovery.
+        io_pause = getattr(client, "_io_pause", None)
+        if io_pause is not None and io_pause.is_set():
+            return False
+        last_input = getattr(client, "_last_input_time", 0.0)
+        stall_timeout = getattr(client, "_STALL_TIMEOUT", 2.0)
+        if last_input > 0 and time.perf_counter() - last_input > stall_timeout * 4:
+            return True
+        return False
+
+    def _cancel_arrival_retry(path):
+        if not path:
+            return
+        task = arrival_retry_tasks.pop(str(path).lower(), None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _schedule_arrival_retries(path):
+        if not path:
+            return
+        retry_key = str(path).lower()
+        existing = arrival_retry_tasks.get(retry_key)
+        if existing is not None and not existing.done():
+            return
+
+        async def _retry():
+            # Absolute targets: 0.25s, 0.75s, 1.5s and 3s after scheduling.
+            previous = 0.0
+            try:
+                for attempt, target in enumerate((0.25, 0.75, 1.5, 3.0), start=1):
+                    await asyncio.sleep(target - previous)
+                    previous = target
+                    if (quit_event.is_set() or
+                            not getattr(CONFIG, "wired_auto_scan_enabled",
+                                        getattr(CONFIG, "wired_usb_enabled", True))):
+                        return
+                    logger.debug("Wired HID arrival retry %d/4 for %s", attempt, path)
+                    request_wired_rescan(
+                        f"device_arrival_retry_{attempt}",
+                        candidate_path=path,
+                    )
+            except asyncio.CancelledError:
+                pass
+            finally:
+                if arrival_retry_tasks.get(retry_key) is asyncio.current_task():
+                    arrival_retry_tasks.pop(retry_key, None)
+
+        arrival_retry_tasks[retry_key] = asyncio.create_task(_retry())
+
+    async def _remove(controller, key, request_rescan=False):
+        if key in removing:
+            return
+        removing.add(key)
+        try:
+            known.pop(key, None)
+            instance_id = getattr(controller, "_hidhide_instance_id", None)
+            async with GLOBAL_LOCK:
+                for i, vc in enumerate(VIRTUAL_CONTROLLERS[:]):
+                    if vc is not None and controller in getattr(vc, "controllers", []):
+                        try:
+                            became_empty = await vc.remove_controller(controller)
+                        except Exception:
+                            logger.exception("Failed to remove wired USB controller")
+                            became_empty = True
+                        if became_empty:
+                            VIRTUAL_CONTROLLERS[i] = None
+                if not (IS_SHUTTING_DOWN or _IS_SUSPENDING):
+                    reorder_controllers()
+                    if UPDATE_CALLBACK is not None:
+                        UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+                    await update_all_player_leds()
+            try:
+                # Bounded: disconnect() joins the interpolation, rumble and read threads and
+                # closes the HID handle. A wedged join must not pin this task forever.
+                await asyncio.wait_for(controller.disconnect(), timeout=DISCONNECT_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning("Wired USB controller disconnect timed out (%s)", key)
+            except Exception:
+                pass
+        finally:
+            removing.discard(key)
+        # Intentionally do NOT unhide on unplug: leaving the instance blacklisted keeps the
+        # physical controller hidden from third-party software the moment it is replugged,
+        # instead of it being briefly visible until the watcher re-hides it. The blacklist
+        # entry is cleaned up on app teardown (see the finally block below).
+
+        # A transport that died while the cable stayed plugged in produces no
+        # WM_DEVICECHANGE, so nothing else would ever ask for a rescan and the pad
+        # would stay gone until the app restarts. Ask once, and reuse the bounded
+        # arrival retries for the case where the pad is still re-enumerating.
+        # Deliberately not a periodic scan: repeated enumeration is known to wedge
+        # HID on some low-end systems.
+        if request_rescan and not (IS_SHUTTING_DOWN or _IS_SUSPENDING):
+            request_wired_rescan("transport_recovery", candidate_path=key)
+            _schedule_arrival_retries(key)
+
+    async def _add(entry, key):
+        controller = None
+        instance_id = None
+        # Slot this call claimed in VIRTUAL_CONTROLLERS. Tracked so the failure path can
+        # hand it back: a claimed-but-never-finished slot is invisible to every cleanup
+        # path (the controller never reaches `known`, so neither _remove() nor the
+        # dead-transport sweep can ever see it) and would be lost until the app restarts.
+        # Four of those and the "no free player slot" branch below rejects every
+        # subsequent scan -- including manual ones.
+        claimed_vc = None
+        try:
+            # Hide the physical HID first (whitelists our own process so we keep access).
+            instance_id = hidhide.hid_path_to_instance_id(entry.get("path"))
+            # Only hide when the user hasn't disabled HidHide. hide_device() re-activates
+            # HidHide filtering, so hiding here regardless of preference would silently undo
+            # a Disable the next time the controller is replugged.
+            if instance_id and hidhide.is_available() and getattr(CONFIG, "hidhide_hide_enabled", True):
+                hidhide.hide_device(instance_id)
+                hidden_instances.add(instance_id)
+
+            controller = USBHidController(entry)
+            controller._hidhide_instance_id = instance_id
+
+            async def _on_disc(c, _k=key):
+                # This fires when the transport itself died (read error or a
+                # silent stall), not on a user-initiated removal, so ask for the
+                # one-shot rescan that lets the pad come back on its own.
+                await _remove(c, _k, request_rescan=True)
+            controller.disconnected_callback = _on_disc
+
+            # Bounded: initialize() reaches pyusb/WinUSB, which can block indefinitely on a
+            # wedged device. Without a ceiling this task never finishes, `key` stays in
+            # `connecting` forever and every later scan skips the pad.
+            await asyncio.wait_for(controller.initialize(), timeout=ADD_INITIALIZE_TIMEOUT)
+
+            async with GLOBAL_LOCK:
+                slot_index = next((i for i, c in enumerate(VIRTUAL_CONTROLLERS) if c is None), None)
+                if slot_index is None:
+                    logger.warning(
+                        "Wired USB pad connected but no free player slot. Slots: %s",
+                        [None if c is None else
+                         f"{getattr(c, 'mode', '?')}/{len(getattr(c, 'controllers', []))}"
+                         for c in VIRTUAL_CONTROLLERS])
+                    await controller.disconnect()
+                    if instance_id:
+                        hidhide.unhide_device(instance_id)
+                        hidden_instances.discard(instance_id)
+                    return
+                vc = VirtualController(slot_index + 1, [controller], _on_disc, setup_usb=False)
+                VIRTUAL_CONTROLLERS[slot_index] = vc
+                claimed_vc = vc
+                await vc.init_added_controller(controller)
+                reorder_controllers()
+                if UPDATE_CALLBACK is not None:
+                    UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+                await update_all_player_leds()
+
+            # Bounded for the same reason: WinUHid creation takes VIRTUAL_DEVICE_CREATION_LOCK
+            # and the driver call can hang, and setup_virtual_device() also raises outright when
+            # the neutral readiness probe is rejected.
+            await asyncio.wait_for(
+                asyncio.to_thread(vc.setup_virtual_device), timeout=ADD_SETUP_TIMEOUT)
+            async def _connection_haptics(c_ref=controller):
+                await c_ref.trigger_connection_haptics()
+            asyncio.create_task(_connection_haptics())
+            known[key] = controller
+            logger.info("Wired USB %s added (%s)",
+                        CONTROLER_NAMES.get(
+                            getattr(controller.controller_info, "product_id", 0),
+                            "controller"),
+                        controller.device.address)
+        except Exception as exc:
+            if isinstance(exc, asyncio.TimeoutError):
+                logger.warning("Timed out adding wired USB controller (%s); releasing slot", key)
+            else:
+                logger.exception("Failed to add wired USB controller")
+            # Hand the player slot back. Skipping this strands a half-built VirtualController
+            # in VIRTUAL_CONTROLLERS that nothing else can ever reap, permanently shrinking
+            # the pool until the app is restarted.
+            if claimed_vc is not None:
+                try:
+                    async with GLOBAL_LOCK:
+                        # Located by identity, not by the index we claimed:
+                        # reorder_controllers() compacts and re-indexes the list, so the vc
+                        # may well have moved since.
+                        current = next((i for i, c in enumerate(VIRTUAL_CONTROLLERS)
+                                        if c is claimed_vc), None)
+                        if current is not None:
+                            try:
+                                await claimed_vc.remove_controller(controller)
+                            except Exception:
+                                logger.debug("Slot rollback remove_controller failed", exc_info=True)
+                            VIRTUAL_CONTROLLERS[current] = None
+                            logger.info("Released player slot %d after failed wired add", current + 1)
+                        if not (IS_SHUTTING_DOWN or _IS_SUSPENDING):
+                            reorder_controllers()
+                            if UPDATE_CALLBACK is not None:
+                                UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+                except Exception:
+                    logger.exception("Failed to release player slot after wired USB add error")
+            if controller is not None:
+                try:
+                    await asyncio.wait_for(controller.disconnect(), timeout=DISCONNECT_TIMEOUT)
+                except Exception:
+                    pass
+            if instance_id:
+                try:
+                    hidhide.unhide_device(instance_id)
+                    hidden_instances.discard(instance_id)
+                except Exception:
+                    pass
+        finally:
+            connecting.pop(key, None)
+
+    try:
+        while not quit_event.is_set():
+            try:
+                try:
+                    controllers = [c for vc in VIRTUAL_CONTROLLERS
+                                   for c in (getattr(vc, "controllers", ()) or ())]
+                    full_capacity = power_saving.full_scan_capacity_reached(controllers)
+                    if full_capacity:
+                        await WIRED_RESCAN_EVENT.wait()
+                    else:
+                        await asyncio.wait_for(WIRED_RESCAN_EVENT.wait(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    if not getattr(CONFIG, "wired_auto_scan_enabled", getattr(CONFIG, "wired_usb_enabled", True)):
+                        for retry_path in list(arrival_retry_tasks):
+                            _cancel_arrival_retry(retry_path)
+                    # Reap `connecting` entries whose _add task never unwound. Piggybacks on
+                    # this existing idle tick, so it costs no extra wakeups.
+                    now_mono = time.monotonic()
+                    for stale_key, started in list(connecting.items()):
+                        if now_mono - started > CONNECTING_STALE_TIMEOUT:
+                            connecting.pop(stale_key, None)
+                            logger.warning(
+                                "Wired USB add for %s never completed after %.0fs; "
+                                "clearing so it can be retried", stale_key,
+                                now_mono - started)
+                    for key, controller in list(known.items()):
+                        if _controller_transport_dead(controller):
+                            logger.info("Wired USB controller transport ended; removing stale controller (%s)", getattr(controller.device, "address", key))
+                            # Fire-and-forget: _remove() tears down WinUHid/USBIP and joins
+                            # worker threads, which can take seconds. Awaiting it here would
+                            # stall this loop and leave WIRED_RESCAN_EVENT unserviced -- which
+                            # is exactly why pressing manual scan appeared to do nothing.
+                            # `removing` already de-duplicates concurrent calls.
+                            asyncio.create_task(_remove(controller, key, request_rescan=True))
+                    continue
+                WIRED_RESCAN_EVENT.clear()
+                await asyncio.sleep(0.5)
+                with WIRED_RESCAN_LOCK:
+                    requests = list(WIRED_RESCAN_REQUESTS)
+                    WIRED_RESCAN_REQUESTS.clear()
+                if not requests:
+                    continue
+                manual_requested = any(manual or reason == "manual_refresh" for reason, _path, manual in requests)
+                removal_requested = any(reason == "device_removal" for reason, _path, _manual in requests)
+                auto_enabled = getattr(CONFIG, "wired_auto_scan_enabled", getattr(CONFIG, "wired_usb_enabled", True))
+                controllers = [c for vc in VIRTUAL_CONTROLLERS
+                               for c in (getattr(vc, "controllers", ()) or ())]
+                if (power_saving.full_scan_capacity_reached(controllers)
+                        and not manual_requested and not removal_requested):
+                    logger.debug("Ignoring wired auto scan at Full-mode capacity: %s", requests)
+                    continue
+                if not auto_enabled and not manual_requested and not removal_requested:
+                    logger.debug("Ignoring wired auto scan while Auto Scan is Off: %s", requests)
+                    continue
+                reason = "+".join(sorted({str(reason) for reason, _path, _manual in requests}))
+                candidate_path = next((path for _reason, path, _manual in reversed(requests) if path), None)
+                if removal_requested:
+                    _cancel_arrival_retry(candidate_path)
+
+                if hidhide.is_available():
+                    visible = await asyncio.to_thread(hidhide.prepare_self_visibility)
+                    logger.debug(
+                        "HidHide self-visibility prepared=%s before wired scan (%s)",
+                        visible,
+                        reason,
+                    )
+                    if not visible:
+                        logger.warning(
+                            "HidHide application-list configuration could not be verified; "
+                            "the wired controller may not be visible to this process."
+                        )
+                if manual_requested:
+                    # A manual scan is the user's explicit "get it back" action, so make it a
+                    # best-effort recovery rather than a plain repeat of the auto path.
+                    # Re-assert HidHide for instances whose controller is gone: unhide, then
+                    # hide again on re-add. Leaving an orphaned instance blacklisted keeps it
+                    # invisible, and hidapi's enumerate opens every device and silently skips
+                    # the ones it cannot open -- so the pad vanishes from the scan entirely.
+                    # This is what an app restart does in its teardown, and it is why only a
+                    # restart used to bring the controller back.
+                    orphaned = [i for i in hidden_instances
+                                if not any(getattr(c, "_hidhide_instance_id", None) == i
+                                           for c in known.values())]
+                    for orphan in orphaned:
+                        try:
+                            await asyncio.to_thread(hidhide.unhide_device, orphan)
+                            hidden_instances.discard(orphan)
+                            logger.info("Manual scan: released orphaned HidHide instance %s", orphan)
+                        except Exception:
+                            logger.debug("Manual scan unhide failed for %s", orphan, exc_info=True)
+
+                chosen = {}
+                entries = await asyncio.to_thread(
+                    enumerate_wired_controllers,
+                    reason,
+                    None,
+                    # Manual scans opt into the unfiltered enumerate + its one-time
+                    # "Nintendo HID devices present/none found" diagnostic. Some hidapi
+                    # builds/states return nothing from the VID/PID-filtered call, which
+                    # previously made a failed manual scan completely silent. One-shot on a
+                    # user action only -- the auto path is unchanged.
+                    manual_requested,
+                )
+                for entry in entries:
+                    key = _device_key(entry)
+                    if key and key not in chosen:
+                        chosen[key] = entry
+                if manual_requested:
+                    logger.info(
+                        "Manual wired scan: found=%d known=%d connecting=%d free_slots=%d",
+                        len(chosen), len(known), len(connecting),
+                        sum(1 for c in VIRTUAL_CONTROLLERS if c is None))
+                if chosen:
+                    _cancel_arrival_retry(candidate_path)
+                elif (candidate_path and "device_arrival" in reason
+                      and "device_arrival_retry" not in reason):
+                    _schedule_arrival_retries(candidate_path)
+                for key, entry in chosen.items():
+                    if key in known or key in connecting:
+                        continue
+                    connecting[key] = time.monotonic()
+                    asyncio.create_task(_add(entry, key))
+                if removal_requested or manual_requested:
+                    for key in list(known):
+                        if key not in chosen:
+                            controller = known.get(key)
+                            if controller is not None:
+                                asyncio.create_task(_remove(controller, key))
+            except Exception:
+                logger.exception("Wired USB discovery scan error")
+    finally:
+        WIRED_RESCAN_EVENT = None
+        for retry_task in list(arrival_retry_tasks.values()):
+            retry_task.cancel()
+        arrival_retry_tasks.clear()
+        # Unhide everything we ever hid — including instances whose controllers were already
+        # unplugged (and thus dropped from `known`) — so no device is left invisible to the
+        # system after teardown.
+        for instance_id in list(hidden_instances):
+            try:
+                hidhide.unhide_device(instance_id)
+            except Exception:
+                pass
+        hidden_instances.clear()
+
+
+def start_discoverer(update_controllers_threadsafe, quit_event, startup_bridge_context=None):
+    asyncio.run(run_discovery_session(update_controllers_threadsafe, quit_event, startup_bridge_context))
+
+def reorder_controllers():
+    global VIRTUAL_CONTROLLERS
+    with DISCOVERY_LOCK:
+
+        active_vcs = []
+        for vc in VIRTUAL_CONTROLLERS:
+            if vc is not None:
+                active_vcs.append(vc)
+        
+        if not active_vcs:
+            return
+
+        # Priority: Pro Controller > GameCube > Combined Joycon > Left Joycon > Right Joycon
+        def get_priority(vc):
+            if vc.is_single():
+                c = vc.controllers[0]
+                if c.is_pro_controller(): return 0
+                if c.controller_info.product_id == NSO_GAMECUBE_CONTROLLER_PID: return 1
+                if c.is_joycon_left(): return 3
+                if c.is_joycon_right(): return 4
+            else:
+                # Combined Joycon pair
+                return 2
+            return 5
+
+        active_vcs.sort(key=get_priority)
+        
+        new_list = [None] * 10
+        for i, vc in enumerate(active_vcs):
+            new_list[i] = vc
+            vc.player_number = i + 1
+        
+        VIRTUAL_CONTROLLERS[:] = new_list
+
+def set_shutting_down(val):
+    global IS_SHUTTING_DOWN
+    IS_SHUTTING_DOWN = val
+
+def set_suspending(val):
+    global _IS_SUSPENDING
+    _IS_SUSPENDING = val
+
+def emergency_cleanup():
+    """Forcefully clear VIRTUAL_CONTROLLERS without waiting for a loop."""
+    global VIRTUAL_CONTROLLERS
+    logger.info("Emergency cleanup: Force clearing all stale controllers.")
+    for i in range(len(VIRTUAL_CONTROLLERS)):
+        vc = VIRTUAL_CONTROLLERS[i]
+        if vc is not None:
+            try:
+                vc.force_close()
+            except:
+                pass
+        VIRTUAL_CONTROLLERS[i] = None
+        
+    # Detach all possible USBIP ports to clear stale attachments
+    try:
+        from virtual_controller import detach_all_usbip_devices
+        detach_all_usbip_devices()
+    except Exception as e:
+        logger.debug(f"Detach USBIP ports in emergency_cleanup failed: {e}")
+    
+    try:
+        from virtual_controller import reset_vigem_bus
+        reset_vigem_bus()
+    except Exception as e:
+        logger.debug(f"Reset bus in emergency_cleanup failed: {e}")
+
+    # force_close() bypasses Controller.disconnect(), so the IR Mouse Raw Input
+    # devices would otherwise outlive their owners here.
+    try:
+        import raw_input_mouse
+        raw_input_mouse.shutdown()
+    except Exception as e:
+        logger.debug(f"Raw Input mouse shutdown in emergency_cleanup failed: {e}")
+
+    try:
+        import keyboard_output
+        keyboard_output.shutdown()
+    except Exception as e:
+        logger.debug(f"Raw Input keyboard shutdown in emergency_cleanup failed: {e}")
+
+
+    if UPDATE_CALLBACK:
+        UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+
+async def update_all_player_leds():
+    for vc in VIRTUAL_CONTROLLERS:
+        if vc is not None:
+            for c in vc.controllers:
+                await c.set_leds(vc.player_number)
+
+async def _split_controller_async(vc_index):
+    global GLOBAL_LOCK
+    if GLOBAL_LOCK is None:
+        return
+    new_vc = None
+    async with GLOBAL_LOCK:
+        vc = VIRTUAL_CONTROLLERS[vc_index]
+        if vc is not None and not vc.is_single():
+            c2 = vc.controllers.pop()
+            await vc.init_added_controller(vc.controllers[0]) # reinit first
+            
+            slot_index = next(i for i, c in enumerate(VIRTUAL_CONTROLLERS) if c == None)
+            new_vc = VirtualController(slot_index + 1, [c2], DISCONNECT_CALLBACK, setup_usb=False)
+            
+            if vc.mode == "Switch1":
+                # Switch1: split without resetting USBIP. Transfer the appropriate server to new_vc.
+                with vc.state_lock, new_vc.state_lock:
+                    new_vc.mode = "Switch1"
+                    new_vc.hold_mode = "Vertical"
+                    new_vc.driver_type = "USBIP"
+                    class MockGamepad:
+                        def register_notification(self, callback_function): pass
+                        def unregister_notification(self): pass
+                        def update(self): pass
+                        def close(self): pass
+                    new_vc.vg_controller = MockGamepad()
+                    
+                    if c2.is_joycon_right():
+                        new_vc.usbip_server_r = getattr(vc, 'usbip_server_r', None)
+                        new_vc.server_port_r = getattr(vc, 'server_port_r', None)
+                        new_vc.bus_id_r = getattr(vc, 'bus_id_r', None)
+                        new_vc.host_ip_r = getattr(vc, 'host_ip_r', None)
+                        if new_vc.usbip_server_r:
+                            new_vc.usbip_server_r.on_rumble_callback = lambda d, p=new_vc.server_port_r: new_vc._usbip_rumble_callback(d, side="Right")
+                        vc.usbip_server_r = None
+                    elif c2.is_joycon_left():
+                        new_vc.usbip_server_l = getattr(vc, 'usbip_server_l', None)
+                        new_vc.server_port_l = getattr(vc, 'server_port_l', None)
+                        new_vc.bus_id_l = getattr(vc, 'bus_id_l', None)
+                        new_vc.host_ip_l = getattr(vc, 'host_ip_l', None)
+                        if new_vc.usbip_server_l:
+                            new_vc.usbip_server_l.on_rumble_callback = lambda d, p=new_vc.server_port_l: new_vc._usbip_rumble_callback(d, side="Left")
+                        vc.usbip_server_l = None
+
+            VIRTUAL_CONTROLLERS[slot_index] = new_vc
+            await new_vc.init_added_controller(c2)
+            
+            reorder_controllers()
+
+            if UPDATE_CALLBACK is not None:
+                UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+                
+            await update_all_player_leds()
+
+    if new_vc is not None:
+        if vc.mode == "Switch1":
+            pass # Handled above
+        else:
+            with vc.state_lock:
+                vc.cleanup_vg_controller()
+            await asyncio.to_thread(vc.setup_virtual_device)
+            await asyncio.to_thread(new_vc.setup_virtual_device)
+
+
+def split_controller(vc_index):
+    if DISCOVERER_LOOP and DISCOVERER_LOOP.is_running():
+        asyncio.run_coroutine_threadsafe(_split_controller_async(vc_index), DISCOVERER_LOOP)
+
+async def _merge_controllers_async(vc_index1, vc_index2):
+    global GLOBAL_LOCK
+    if GLOBAL_LOCK is None:
+        return
+    async with GLOBAL_LOCK:
+        # Ensure vc_index1 is the lower index to prioritize Player 1
+        if vc_index1 > vc_index2:
+            vc_index1, vc_index2 = vc_index2, vc_index1
+            
+        vc1 = VIRTUAL_CONTROLLERS[vc_index1]
+        vc2 = VIRTUAL_CONTROLLERS[vc_index2]
+        
+        if vc1 is not None and vc2 is not None and vc1.is_single() and vc2.is_single():
+            c2 = vc2.controllers[0]
+            
+            # Switch1 Emu Mode: extract the usbip servers from vc2 BEFORE removing the controller
+            # so remove_controller's cleanup won't shut them down!
+            if vc1.mode == "Switch1":
+                with vc1.state_lock, vc2.state_lock:
+                    if c2.is_joycon_right():
+                        vc1.usbip_server_r = getattr(vc2, 'usbip_server_r', None)
+                        vc1.server_port_r = getattr(vc2, 'server_port_r', None)
+                        vc1.bus_id_r = getattr(vc2, 'bus_id_r', None)
+                        vc1.host_ip_r = getattr(vc2, 'host_ip_r', None)
+                        if vc1.usbip_server_r:
+                            vc1.usbip_server_r.on_rumble_callback = lambda d, p=vc1.server_port_r: vc1._usbip_rumble_callback(d, side="Right")
+                        vc2.usbip_server_r = None
+                        vc2.server_port_r = None
+                    elif c2.is_joycon_left():
+                        vc1.usbip_server_l = getattr(vc2, 'usbip_server_l', None)
+                        vc1.server_port_l = getattr(vc2, 'server_port_l', None)
+                        vc1.bus_id_l = getattr(vc2, 'bus_id_l', None)
+                        vc1.host_ip_l = getattr(vc2, 'host_ip_l', None)
+                        if vc1.usbip_server_l:
+                            vc1.usbip_server_l.on_rumble_callback = lambda d, p=vc1.server_port_l: vc1._usbip_rumble_callback(d, side="Left")
+                        vc2.usbip_server_l = None
+                        vc2.server_port_l = None
+                        
+            await vc2.remove_controller(c2)
+            VIRTUAL_CONTROLLERS[vc_index2] = None
+            
+            vc1.add_controller(c2)
+            await vc1.init_added_controller(c2)
+            
+            reorder_controllers()
+
+            if UPDATE_CALLBACK is not None:
+                UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+                
+            await update_all_player_leds()
+            
+            if vc1.mode == "Switch1":
+                pass # We already transferred it above, nothing else to do here
+            else:
+                with vc1.state_lock:
+                    vc1.cleanup_vg_controller()
+                await asyncio.to_thread(vc1.setup_virtual_device)
+
+def merge_controllers(vc_index1, vc_index2):
+    if DISCOVERER_LOOP and DISCOVERER_LOOP.is_running():
+        asyncio.run_coroutine_threadsafe(_merge_controllers_async(vc_index1, vc_index2), DISCOVERER_LOOP)
+
+if __name__ == "__main__":
+    start_discoverer(None, threading.Event())
