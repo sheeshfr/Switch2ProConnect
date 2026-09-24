@@ -1,1 +1,0 @@
-start python src/gui.py
