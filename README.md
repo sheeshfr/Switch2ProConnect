@@ -3,8 +3,6 @@
   <h1>Switch 2 Pro Connect</h1>
 </div>
 
----
-
 <div align="center">
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-287cff?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Platform: Windows 10 & 11">
   <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square&color=9be1e6&labelColor=e4896e" alt="License"></a>
