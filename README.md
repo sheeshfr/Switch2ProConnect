@@ -1,33 +1,30 @@
 <div align="center">
-  <img src="resources/images/icon.png" alt="Switch 2 Pro Connect Logo" width="160" />
+  <img src="resources/images/icon.png" alt="Switch 2 Pro Connect Logo" width="128" />
   <h1>Switch 2 Pro Connect</h1>
+  <p>A dedicated Switch 2 Pro Controller companion utility for Windows and Linux with back-paddle remapping, automatic per-game profiles, and a streamlined UI.</p>
+  <p>Vibe coded by <a href="https://github.com/sheeshfr"><b>SheeshFr</b></a></p>
 </div>
 
+---
+
+## Features
+
+- **Switch 2 Pro Controller Exclusively:** Strips out Joy-Con and secondary controller complexity to deliver a dedicated, reliable setup for the Switch 2 Pro Controller over Bluetooth or USB-C.
+- **Convenient Back-Button Assignment:** Quickly remap the GL and GR back paddles by tapping the paddle and pressing the desired target button on the controller. Pressing the **C** button mid-game instantly brings the interface into focus for on-the-fly tweaks.
+- **Automatic Per-Game Profiles:** Assign distinct back-button layouts per game. The app detects active foreground processes (including Wine/Proton games) and switches profiles automatically as you launch or switch between games.
+- **Native Cross-Platform (Windows & Linux):** Built-in support for Linux via `/dev/uinput` with force-feedback rumble, gyro mouse, exclusive device grab (`EVIOCGRAB` to prevent double inputs without needing HidHide), and X11/Wayland window tracking.
+
 <div align="center">
-  <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-287cff?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Platform: Windows 10 & 11">
-  <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square&color=9be1e6&labelColor=e4896e" alt="License"></a>
-
-  <p>Switch 2 Pro Connect mod focused on the Switch 2 Pro controller and a streamlined UI.</p>
-  <p>Vibe Coded by <a href="https://github.com/sheeshfr"><b>SheeshFr</b></a></p>
-
-  <br />
-
   <img src="resources/images/preview_pairing.png" alt="Pairing Screen" width="48%" />
   &nbsp;
   <img src="resources/images/preview_connected.png" alt="Connected Screen" width="48%" />
 </div>
 
-## Overview
-
-Switch 2 Pro Connect mod focused on the Switch 2 Pro controller and a streamlined UI:
-
-1. **Switch 2 Pro Controller Exclusively**: Strips out Joy-Con and secondary controller complexity to deliver a dedicated, reliable setup for the Switch 2 Pro Controller over Bluetooth or USB-C.
-2. **Convenient Back-Button Assignment**: Quickly remap the GL and GR back paddles by tapping the paddle and pressing the desired target button on the controller. Pressing the **C** button mid-game instantly brings the interface into focus for on-the-fly tweaks.
-3. **Automatic Per-Game Profiles**: Assign distinct back-button layouts per game. The app detects active foreground processes and switches profiles automatically as you launch or switch between games.
-
 ---
 
 ## Setup
+
+### Windows
 
 1. Download the release archive: [Switch2ProConnect_v1.0_Release.zip](https://github.com/sheeshfr/Switch2ProConnect/releases/download/v1.0/Switch2ProConnect_v1.0_Release.zip).
 2. Extract the archive and launch `Switch2ProConnect_v1.0_(ShFr_UI_Mod).exe`.
@@ -38,6 +35,24 @@ Switch 2 Pro Connect mod focused on the Switch 2 Pro controller and a streamline
    - **Bluetooth**: Hold the **SYNC** button on the controller until the LEDs cycle; pairing is automatic.
    - **Wired**: Connect via USB-C cable.
 5. Map back buttons as desired and configure per-game profiles.
+
+### Linux
+
+1. Clone or extract the repository onto your Linux system.
+2. Ensure the launcher files are executable (only needed once):
+   ```bash
+   chmod +x Switch2ProConnect.sh Switch2ProConnect.desktop
+   ```
+3. Simply **double-click** the **`Switch 2 Pro Connect.desktop`** entry (it displays the Switch 2 controller logo!) or run:
+   ```bash
+   ./Switch2ProConnect.sh
+   ```
+   * **First Launch**: The launcher automatically detects that it is the initial run, creates the Python virtual environment (`.venv`), installs all required packages, prompts to install controller udev rules to `/etc/udev/rules.d/`, and adds a shortcut to your desktop application launcher with the logo icon.
+   * **Subsequent Launches**: The launcher verifies the prerequisites and immediately launches the app in the background—no terminals, prompts, or delays!
+4. Connect the controller:
+   - **Bluetooth**: Hold the **SYNC** button on the controller until the LEDs cycle; pairing is automatic.
+   - **Wired**: Connect via USB-C cable.
+5. On Linux, virtual Xbox 360 controller emulation and force-feedback rumble work natively through `/dev/uinput`—no proprietary drivers (ViGEmBus or WinUHid) needed! Exclusive device grabbing (`EVIOCGRAB`) automatically prevents duplicate inputs in Steam, Wine/Proton, and native games without needing HidHide.
 
 ---
 
