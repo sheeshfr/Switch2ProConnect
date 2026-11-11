@@ -246,6 +246,7 @@ from gui_widgets import (
     get_rounded_rect_image,
     make_rounded_button,
     set_rounded_button_bg,
+    rescale_rounded_widget,
     update_toggle_button,
     Tooltip,
     RecordingEntry,
@@ -253,6 +254,7 @@ from gui_widgets import (
     BackButtonSelector,
     ProfileBackButtonSelector,
     ToggleSwitch,
+    get_checkbox_images,
     COLOR_OFF,
     COLOR_OFF_HOVER,
     COLOR_OFF_PRESS,
@@ -415,6 +417,20 @@ logger.info(
     "GUI executable=%s frozen=%s",
     sys.executable, bool(getattr(sys, "frozen", False)))
 
+def _effective_screen_height(width, height):
+    """Short-edge physical resolution so portrait displays match landscape equivalents."""
+    try:
+        w = int(width)
+        h = int(height)
+        if w > 0 and h > 0:
+            return min(w, h)
+        if h > 0:
+            return h
+    except (TypeError, ValueError):
+        pass
+    return 1440
+
+
 try:
     # Break out of Windows terminal DPI virtualization cache to get TRUE physical resolution
     ctypes.windll.shcore.SetProcessDpiAwareness(2) # PROCESS_PER_MONITOR_DPI_AWARE
@@ -425,9 +441,10 @@ except Exception:
         pass
 
 try:
-    screen_height = ctypes.windll.user32.GetSystemMetrics(1) # SM_CYSCREEN
-    if not screen_height or screen_height <= 0:
-        screen_height = 1440
+    screen_height = _effective_screen_height(
+        ctypes.windll.user32.GetSystemMetrics(0),  # SM_CXSCREEN
+        ctypes.windll.user32.GetSystemMetrics(1),  # SM_CYSCREEN
+    )
 except Exception:
     screen_height = 1440
 
@@ -496,14 +513,17 @@ def _monitor_metrics(monitor):
         info.cbSize = ctypes.sizeof(info)
         if not get_monitor_info(ctypes.c_void_p(int(monitor)), ctypes.byref(info)):
             return None
+        width = int(info.rcMonitor.right - info.rcMonitor.left)
+        height = int(info.rcMonitor.bottom - info.rcMonitor.top)
         return {
             "handle": int(monitor),
             "left": int(info.rcMonitor.left),
             "top": int(info.rcMonitor.top),
             "right": int(info.rcMonitor.right),
             "bottom": int(info.rcMonitor.bottom),
-            "width": int(info.rcMonitor.right - info.rcMonitor.left),
-            "height": int(info.rcMonitor.bottom - info.rcMonitor.top),
+            "width": width,
+            "height": height,
+            "effective_height": _effective_screen_height(width, height),
             "work_left": int(info.rcWork.left),
             "work_top": int(info.rcWork.top),
             "work_right": int(info.rcWork.right),
@@ -579,8 +599,40 @@ def _get_window_dpi(hwnd):
     return None
 
 
+def _is_mouse_dragging():
+    """True while the primary mouse button is held down (e.g. live titlebar drag)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        vk = 0x02 if user32.GetSystemMetrics(23) else 0x01  # SM_SWAPBUTTON
+        return bool(user32.GetAsyncKeyState(vk) & 0x8000)
+    except Exception:
+        return False
+
+
+def _cursor_anchored_drag_position(old_rect, new_outer_width, new_outer_height):
+    """Keep the titlebar anchored proportionally under the cursor during a live drag."""
+    old_x, old_y = int(old_rect[0]), int(old_rect[1])
+    old_w = max(1, int(old_rect[2] - old_rect[0]))
+    if sys.platform != "win32":
+        return old_x, old_y
+    try:
+        pt = wintypes.POINT()
+        if ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
+            rel_x = (pt.x - old_x) / float(old_w)
+            if -0.1 <= rel_x <= 1.1:
+                clamped_rel_x = min(0.85, max(0.15, rel_x))
+                new_x = int(round(pt.x - clamped_rel_x * new_outer_width))
+                return new_x, old_y
+    except Exception:
+        pass
+    return old_x, old_y
+
+
 def _fit_window_to_work_area(monitor, desired_client_width,
-                             desired_client_height, hwnd=None, x=None, y=None):
+                             desired_client_height, hwnd=None, x=None, y=None,
+                             clamp_position=True):
     """Fit a decorated main window inside rcWork without changing its width rule."""
     desired_client_width = max(1, int(desired_client_width))
     desired_client_height = max(1, int(desired_client_height))
@@ -594,11 +646,14 @@ def _fit_window_to_work_area(monitor, desired_client_width,
                 0, (outer[2] - outer[0]) - (client[2] - client[0]))
             non_client_height = max(
                 0, (outer[3] - outer[1]) - (client[3] - client[1]))
-        else:
+        elif sys.platform == "win32":
             user32 = ctypes.windll.user32
             non_client_width = 2 * (
                 user32.GetSystemMetrics(32) + user32.GetSystemMetrics(92))
             non_client_height = _get_window_non_client_height()
+        else:
+            non_client_width = 0
+            non_client_height = 30
     except Exception:
         non_client_width = 0
         non_client_height = 0
@@ -614,7 +669,7 @@ def _fit_window_to_work_area(monitor, desired_client_width,
     outer_height = client_height + non_client_height
     target_x = int(x if x is not None else (monitor["work_left"] if monitor else 0))
     target_y = int(y if y is not None else (monitor["work_top"] if monitor else 0))
-    if monitor:
+    if monitor and clamp_position:
         if outer_width <= monitor["work_width"]:
             target_x = min(
                 max(target_x, monitor["work_left"]),
@@ -677,12 +732,18 @@ def refresh_ui_scaling(current_screen_height=None, current_work_height=None):
     # The monitor ratio owns window height. The in-app scale is applied only
     # to width at the geometry call sites below.
     window_resolution_ratio = screen_height / 1440.0
-    scaling_factor = 1.2 * resolution_ratio
+    scaling_factor = round(1.2 * resolution_ratio, 6)
     controller_frame_size = _scaled_px(180)
     battery_height = _scaled_px(24)
     player_row_height = _scaled_px(30)
     player_led_width = _scaled_px(54)
     player_led_height = _scaled_px(8)
+    try:
+        inst = getattr(globals().get("ControllerWindow"), "_current_instance", None)
+        if inst is not None and getattr(inst, "root", None) is not None:
+            inst.root.scaling_factor = scaling_factor
+    except Exception:
+        pass
 
 refresh_ui_scaling()
 
@@ -784,6 +845,10 @@ from gui_wizards import (
 class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMixin):
     _current_instance = None
 
+    @property
+    def scaling_factor(self):
+        return scaling_factor
+
     def __init__(self):
         ControllerWindow._current_instance = self
         import sys
@@ -816,6 +881,7 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
         self._dpi_independent_outer_position = None
         self._width_reconcile_after_id = None
         self._monitor_check_after_id = None
+        self._post_drag_clamp_after_id = None
         self._dynamic_scale_in_progress = False
         self._dynamic_widget_baselines = weakref.WeakKeyDictionary()
         self.last_foreground_app_path = None
@@ -875,6 +941,8 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
         pixel_anchor = {"x": None, "y": None}
 
         def top_level_hwnd(widget):
+            if sys.platform != "win32":
+                return None
             try:
                 hwnd = widget.winfo_id()
                 root_hwnd = ctypes.windll.user32.GetAncestor(hwnd, 2)  # GA_ROOT
@@ -956,19 +1024,26 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
                 x = anchor["x"] - width // 2
                 y = anchor["y"] - height // 2
 
-                try:
-                    virtual_x = ctypes.windll.user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
-                    virtual_y = ctypes.windll.user32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
-                    virtual_w = ctypes.windll.user32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
-                    virtual_h = ctypes.windll.user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
-                except (AttributeError, OSError):
-                    virtual_x = self.root.winfo_vrootx()
-                    virtual_y = self.root.winfo_vrooty()
-                    virtual_w = self.root.winfo_vrootwidth()
-                    virtual_h = self.root.winfo_vrootheight()
-                if virtual_w > 1 and virtual_h > 1:
-                    x = min(max(x, virtual_x), virtual_x + virtual_w - width)
-                    y = min(max(y, virtual_y), virtual_y + virtual_h - height)
+                target_mon = _monitor_metrics_from_point(anchor["x"], anchor["y"])
+                if target_mon:
+                    if width <= target_mon["work_width"]:
+                        x = min(max(x, target_mon["work_left"]), target_mon["work_right"] - width)
+                    if height <= target_mon["work_height"]:
+                        y = min(max(y, target_mon["work_top"]), target_mon["work_bottom"] - height)
+                else:
+                    try:
+                        virtual_x = ctypes.windll.user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
+                        virtual_y = ctypes.windll.user32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
+                        virtual_w = ctypes.windll.user32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
+                        virtual_h = ctypes.windll.user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
+                    except (AttributeError, OSError):
+                        virtual_x = self.root.winfo_vrootx()
+                        virtual_y = self.root.winfo_vrooty()
+                        virtual_w = self.root.winfo_vrootwidth()
+                        virtual_h = self.root.winfo_vrootheight()
+                    if virtual_w > 1 and virtual_h > 1:
+                        x = min(max(x, virtual_x), virtual_x + virtual_w - width)
+                        y = min(max(y, virtual_y), virtual_y + virtual_h - height)
 
                 window.geometry(f"{width}x{height}+{x}+{y}")
                 window.lift(owner)
@@ -978,16 +1053,32 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
                 if (pixel_anchor["x"] is not None and dialog_hwnd and
                         ctypes.windll.user32.GetWindowRect(
                             dialog_hwnd, ctypes.byref(dialog_rect))):
-                    measured_w = dialog_rect.right - dialog_rect.left
-                    measured_h = dialog_rect.bottom - dialog_rect.top
-                    outer_w = measured_w if measured_w > 10 else width
-                    outer_h = measured_h if measured_h > 10 else height
+                    fit_mon = _monitor_metrics_from_point(pixel_anchor["x"], pixel_anchor["y"]) or target_mon
+                    fitted_tl = _fit_window_to_work_area(
+                        fit_mon, width, height, hwnd=dialog_hwnd,
+                        x=pixel_anchor["x"] - (width // 2),
+                        y=pixel_anchor["y"] - (height // 2),
+                    )
+                    outer_w = fitted_tl["outer_width"]
+                    outer_h = fitted_tl["outer_height"]
                     physical_x = pixel_anchor["x"] - outer_w // 2
                     physical_y = pixel_anchor["y"] - outer_h // 2
+                    if fit_mon:
+                        if outer_w <= fit_mon["work_width"]:
+                            physical_x = min(max(physical_x, fit_mon["work_left"]), fit_mon["work_right"] - outer_w)
+                        if outer_h <= fit_mon["work_height"]:
+                            physical_y = min(max(physical_y, fit_mon["work_top"]), fit_mon["work_bottom"] - outer_h)
+                    # Move and explicitly enforce outer size so cross-monitor WM_DPICHANGED
+                    # never shrinks or inflates the Toplevel behind Tk's back.
                     ctypes.windll.user32.SetWindowPos(
-                        dialog_hwnd, 0, physical_x, physical_y, 0, 0,
-                        0x0001 | 0x0004 | 0x0010,  # NOSIZE | NOZORDER | NOACTIVATE
+                        dialog_hwnd, 0, physical_x, physical_y, outer_w, outer_h,
+                        0x0004 | 0x0010,  # NOZORDER | NOACTIVATE
                     )
+                    try:
+                        window.tk.call('tk', 'scaling', 1.3333333333333333)
+                        window.geometry(f"{fitted_tl['client_width']}x{fitted_tl['client_height']}+{physical_x}+{physical_y}")
+                    except tk.TclError:
+                        pass
             except (tk.TclError, RuntimeError, OSError, ValueError, ctypes.ArgumentError):
                 pass
 
@@ -2507,14 +2598,18 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
         try:
             if initial_monitor:
                 refresh_ui_scaling(
-                    initial_monitor["height"], initial_monitor["work_height"])
+                    initial_monitor["effective_height"], initial_monitor["work_height"])
                 self._ui_monitor_handle = initial_monitor["handle"]
                 self._ui_monitor_signature = _monitor_work_signature(
                     initial_monitor)
             else:
-                refresh_ui_scaling(self.root.winfo_screenheight())
+                refresh_ui_scaling(
+                    _effective_screen_height(
+                        self.root.winfo_screenwidth(),
+                        self.root.winfo_screenheight()))
         except Exception:
             refresh_ui_scaling()
+        self.root.scaling_factor = scaling_factor
 
         self.calibration_overlay = CalibrationOverlay(self.root)
         import utils
@@ -3395,10 +3490,18 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
             self.root.update_idletasks()
             root_pad = self.root.winfo_pixels(self.root.cget("padx"))
             content_widths = []
-            for name in ("header_frame", "content_container", "main_frame", "settings_frame"):
-                widget = getattr(self, name, None)
-                if widget is not None and widget.winfo_exists():
-                    content_widths.append(widget.winfo_reqwidth())
+            if getattr(self, "_layout_connected_state", False):
+                cluster = getattr(self, "center_cluster", None)
+                if cluster is not None and cluster.winfo_exists():
+                    content_widths.append(cluster.winfo_reqwidth())
+            else:
+                mf = getattr(self, "main_frame", None)
+                if mf is not None and mf.winfo_exists():
+                    content_widths.append(mf.winfo_reqwidth())
+            footer_drv = getattr(self, "footer_drivers_frame", None)
+            if footer_drv is not None and footer_drv.winfo_exists():
+                gear_pad = int(84 * scaling_factor)
+                content_widths.append(footer_drv.winfo_reqwidth() + gear_pad)
             min_content = (max(content_widths) + (2 * root_pad) + 4) if content_widths else 0
             base = int(BASE_WINDOW_WIDTH * window_resolution_ratio)
             return max(base, min_content)
@@ -3523,7 +3626,7 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
             hwnd = _top_level_hwnd(self.root)
             monitor = _monitor_metrics_from_window(hwnd) if hwnd else None
             if monitor:
-                refresh_ui_scaling(monitor["height"], monitor["work_height"])
+                refresh_ui_scaling(monitor["effective_height"], monitor["work_height"])
             else:
                 refresh_ui_scaling()
             new_scale = float(scaling_factor)
@@ -3562,11 +3665,12 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
                 self._dpi_independent_outer_position = (
                     stable_rect[0], stable_rect[1])
                 self._ui_window_dpi = _get_window_dpi(hwnd)
-            self.content_canvas.itemconfigure(
-                self._scroll_content_window,
-                width=max(self.content_canvas.winfo_width(),
-                          self._measure_scroll_content_width()))
-            self.root.after_idle(self._update_content_scrollregion)
+            if getattr(self, "content_canvas", None) is not None:
+                self.content_canvas.itemconfigure(
+                    self._scroll_content_window,
+                    width=max(self.content_canvas.winfo_width(),
+                              self._measure_scroll_content_width()))
+                self.root.after_idle(self._update_content_scrollregion)
             logger.info(
                 "In-app UI scale applied: %.1f; content %.4f -> %.4f; "
                 "window=%dx%d formula_width=%d required_width=%d",
@@ -3634,7 +3738,7 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
                     return None
         return tuple(pixels)
 
-    def _rescale_widget_tree(self, old_scale, new_scale):
+    def _rescale_widget_tree(self, old_scale, new_scale, root_widget=None):
         """Apply a new absolute scale to the already-created Tk widget tree.
 
         Widget construction throughout this module deliberately uses physical
@@ -3645,6 +3749,50 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
         """
         if old_scale <= 0 or new_scale <= 0:
             return
+        target_root = root_widget if root_widget is not None else self.root
+        if target_root is None:
+            return
+        try:
+            target_root.tk.call('tk', 'scaling', 1.3333333333333333)
+        except tk.TclError:
+            pass
+
+        if target_root is self.root:
+            if getattr(self, "_slide_animation_id", None) is not None:
+                try:
+                    self.root.after_cancel(self._slide_animation_id)
+                except Exception:
+                    pass
+                self._slide_animation_id = None
+                if hasattr(self, "center_cluster") and self.center_cluster.winfo_exists():
+                    try:
+                        self.center_cluster.place_configure(relx=0.5, rely=0.5, anchor=tk.CENTER, x=0)
+                    except Exception:
+                        pass
+            try:
+                self.root.configure(
+                    padx=int(8 * new_scale), pady=int(6 * new_scale))
+            except tk.TclError:
+                pass
+        else:
+            try:
+                tl_base = self._dynamic_widget_baselines.get(target_root)
+                if tl_base is None:
+                    tl_base = {"options": {}}
+                    for opt in ("padx", "pady"):
+                        norm = self._pixel_layout_value(
+                            target_root, target_root.cget(opt), old_scale)
+                        if norm is not None:
+                            tl_base["options"][opt] = norm
+                    self._dynamic_widget_baselines[target_root] = tl_base
+                tl_updates = {
+                    opt: self._scaled_layout_value(val, new_scale)
+                    for opt, val in tl_base["options"].items()
+                }
+                if tl_updates:
+                    target_root.configure(**tl_updates)
+            except (tk.TclError, RuntimeError):
+                pass
 
         common_options = (
             "padx", "pady", "borderwidth", "highlightthickness",
@@ -3655,6 +3803,25 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
             "Scale", "Scrollbar", "TScrollbar", "Panedwindow",
         }
 
+        def capture_manager_layout(widget, manager, scale_ref):
+            layout_dict = {}
+            if manager in ("pack", "grid", "place"):
+                info = getattr(widget, manager + "_info")()
+                layout_names = (
+                    ("padx", "pady", "ipadx", "ipady")
+                    if manager in ("pack", "grid")
+                    else ("x", "y", "width", "height")
+                )
+                for option in layout_names:
+                    value = info.get(option)
+                    if value in (None, ""):
+                        continue
+                    normalized = self._pixel_layout_value(
+                        widget, value, scale_ref)
+                    if normalized is not None:
+                        layout_dict[option] = normalized
+            return layout_dict
+
         def visit(widget):
             try:
                 children = widget.winfo_children()
@@ -3664,7 +3831,11 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
                 baseline = self._dynamic_widget_baselines.get(widget)
                 manager = widget.winfo_manager()
                 if baseline is None:
-                    baseline = {"options": {}, "manager": manager, "layout": {}}
+                    baseline = {
+                        "options": {},
+                        "manager": manager,
+                        "layout": capture_manager_layout(widget, manager, old_scale),
+                    }
                     option_names = list(common_options)
                     if widget.winfo_class() in pixel_sized_classes:
                         option_names.extend(("width", "height"))
@@ -3683,22 +3854,6 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
                         if normalized is not None:
                             baseline["options"][option] = normalized
 
-                    if manager in ("pack", "grid", "place"):
-                        info = getattr(widget, manager + "_info")()
-                        layout_names = (
-                            ("padx", "pady", "ipadx", "ipady")
-                            if manager in ("pack", "grid")
-                            else ("x", "y", "width", "height")
-                        )
-                        for option in layout_names:
-                            value = info.get(option)
-                            if value in (None, ""):
-                                continue
-                            normalized = self._pixel_layout_value(
-                                widget, value, old_scale)
-                            if normalized is not None:
-                                baseline["layout"][option] = normalized
-
                     if "font" in available:
                         try:
                             font_parts = list(widget.tk.splitlist(widget.cget("font")))
@@ -3712,6 +3867,10 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
                         except (tk.TclError, TypeError, ValueError):
                             pass
                     self._dynamic_widget_baselines[widget] = baseline
+                elif baseline.get("manager") != manager:
+                    baseline["manager"] = manager
+                    baseline["layout"] = capture_manager_layout(
+                        widget, manager, old_scale)
 
                 updates = {
                     option: self._scaled_layout_value(value, new_scale)
@@ -3736,6 +3895,11 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
                     }
                     getattr(widget, manager + "_configure")(**layout)
 
+                if hasattr(widget, "_rounded_spec"):
+                    rescale_rounded_widget(widget, new_scale)
+                if hasattr(widget, "rescale_fonts"):
+                    widget.rescale_fonts(new_scale)
+
             except (tk.TclError, RuntimeError):
                 # One unsupported option must not prevent the rest of that
                 # container's descendants from being scaled.
@@ -3743,8 +3907,26 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
             for child in children:
                 visit(child)
 
-        for child in self.root.winfo_children():
+        for child in target_root.winfo_children():
+            # Avoid recursing from root into separate Toplevel windows; each
+            # Toplevel manages its own monitor scale independently.
+            if isinstance(child, tk.Toplevel):
+                continue
             visit(child)
+
+        if target_root is not self.root:
+            return
+
+        if getattr(self, "_layout_connected_state", False):
+            pad_gap = int(22 * new_scale)
+            try:
+                if hasattr(self, "left_column") and self.left_column.winfo_exists():
+                    self.left_column.pack_configure(padx=(0, pad_gap))
+                if (hasattr(self, "right_column") and self.right_column.winfo_exists()
+                        and self.right_column.winfo_manager() == "pack"):
+                    self.right_column.pack_configure(padx=(pad_gap, 0))
+            except tk.TclError:
+                pass
 
         # This named font is shared by the main action buttons and therefore does
         # not appear as a numeric font tuple on each individual widget.
@@ -3794,16 +3976,206 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
 
         if getattr(self, "gear_btn", None) is not None:
             try:
-                w = int(34 * scaling_factor)
-                h = int(30 * scaling_factor)
-                r = int(6 * scaling_factor)
-                isize = (int(20 * scaling_factor), int(20 * scaling_factor))
-                self.gear_btn.image_normal = get_rounded_rect_image(w, h, r, button_gray, parent_bg=background_color, icon_img="images/gear.png", icon_size=isize, parent=getattr(self, "footer_frame", None))
-                self.gear_btn.image_hover = get_rounded_rect_image(w, h, r, "#5A5A5A", parent_bg=background_color, icon_img="images/gear.png", icon_size=isize, parent=getattr(self, "footer_frame", None))
-                self.gear_btn.image_press = get_rounded_rect_image(w, h, r, "#3A3A3A", parent_bg=background_color, icon_img="images/gear.png", icon_size=isize, parent=getattr(self, "footer_frame", None))
-                self.gear_btn.configure(image=self.gear_btn.image_normal)
+                rescale_rounded_widget(self.gear_btn, float(scaling_factor))
             except Exception as exc:
                 logger.debug("Failed to refresh gear image after display change: %s", exc)
+
+        self._refresh_settings_checkbox_images(float(scaling_factor))
+
+    def _refresh_settings_checkbox_images(self, target_scale):
+        try:
+            cbs = [
+                getattr(self, name, None)
+                for name in ("startup_cb", "minimized_cb", "power_saving_cb")
+            ]
+            alive = [cb for cb in cbs if cb is not None and cb.winfo_exists()]
+            if alive:
+                self.cb_img_uncheck, self.cb_img_check = get_checkbox_images(
+                    size_px=18, scaling=target_scale)
+                for cb in alive:
+                    cb.configure(
+                        image=self.cb_img_uncheck,
+                        selectimage=self.cb_img_check)
+        except Exception as exc:
+            logger.debug("Failed to refresh settings checkbox images: %s", exc)
+
+    def _attach_toplevel_dpi_scaler(self, window):
+        if sys.platform != "win32" or window is None or getattr(window, "_ui_scaler_attached", False):
+            return
+        window._ui_scaler_attached = True
+        window._ui_applied_scale = float(scaling_factor)
+        window._ui_monitor_sig = None
+        window._ui_window_dpi = None
+        window._ui_base_client_size = None
+        window._ui_scale_busy = False
+        window._ui_check_after_id = None
+        window._ui_drag_clamp_after_id = None
+
+        def _on_tl_configure(event):
+            if event.widget is not window or getattr(window, "_ui_scale_busy", False):
+                return
+            try:
+                if window._ui_check_after_id is not None:
+                    window.after_cancel(window._ui_check_after_id)
+                window._ui_check_after_id = window.after(
+                    80, self._check_toplevel_monitor_scale, window)
+            except tk.TclError:
+                window._ui_check_after_id = None
+
+        window.bind("<Configure>", _on_tl_configure, add="+")
+
+    def _finish_toplevel_post_drag_clamp(self, window):
+        if window is None or not window.winfo_exists():
+            return
+        window._ui_drag_clamp_after_id = None
+        if _is_mouse_dragging():
+            try:
+                window._ui_drag_clamp_after_id = window.after(
+                    100, self._finish_toplevel_post_drag_clamp, window)
+            except tk.TclError:
+                pass
+            return
+        self._check_toplevel_monitor_scale(window, force_clamp=True)
+
+    def _check_toplevel_monitor_scale(self, window, force_clamp=False):
+        global scaling_factor
+        if window is None or getattr(self, "is_quitting", False):
+            return
+        window._ui_check_after_id = None
+        if getattr(window, "_ui_scale_busy", False):
+            return
+        try:
+            if not window.winfo_exists() or window.state() != "normal":
+                return
+            hwnd = _top_level_hwnd(window)
+            if not hwnd:
+                return
+            monitor = _monitor_metrics_from_window(hwnd)
+            if not monitor:
+                return
+            sig = _monitor_work_signature(monitor)
+            dpi = _get_window_dpi(hwnd)
+            target_ratio = _monitor_content_ratio(
+                monitor["effective_height"], _normalized_user_ui_scale())
+            target_scale = round(1.2 * target_ratio, 6)
+            applied_scale = float(getattr(window, "_ui_applied_scale", target_scale) or target_scale)
+
+            client_rect = win32gui.GetClientRect(int(hwnd))
+            cur_cw = max(1, client_rect[2] - client_rect[0])
+            cur_ch = max(1, client_rect[3] - client_rect[1])
+            if window._ui_base_client_size is None and cur_cw > 40 and cur_ch > 40:
+                window._ui_base_client_size = (
+                    cur_cw / applied_scale,
+                    cur_ch / applied_scale,
+                )
+
+            scale_diff = abs(target_scale - applied_scale) >= 0.0001
+            dpi_diff = (
+                dpi is not None
+                and window._ui_window_dpi is not None
+                and dpi != window._ui_window_dpi
+            )
+            if not scale_diff and not dpi_diff and not force_clamp:
+                window._ui_monitor_sig = sig
+                window._ui_window_dpi = dpi
+                return
+
+            window._ui_scale_busy = True
+            try:
+                window._ui_monitor_sig = sig
+                window._ui_window_dpi = dpi
+                outer_rect = win32gui.GetWindowRect(int(hwnd))
+                dragging = _is_mouse_dragging()
+
+                if scale_diff and window is getattr(self, "edit_profiles_dialog", None):
+                    saved_sf = scaling_factor
+                    try:
+                        scaling_factor = target_scale
+                        if self.root is not None:
+                            self.root.scaling_factor = target_scale
+                        window._ui_applied_scale = target_scale
+                        self._populate_edit_profiles_dialog(
+                            window, preserve_position=(outer_rect[0], outer_rect[1]),
+                            clamp_position=not dragging)
+                    finally:
+                        scaling_factor = saved_sf
+                        if self.root is not None:
+                            self.root.scaling_factor = saved_sf
+                    if dragging:
+                        window._ui_drag_clamp_after_id = window.after(
+                            100, self._finish_toplevel_post_drag_clamp, window)
+                    return
+
+                if scale_diff:
+                    saved_sf = scaling_factor
+                    try:
+                        scaling_factor = target_scale
+                        if self.root is not None:
+                            self.root.scaling_factor = target_scale
+                        self._rescale_widget_tree(
+                            applied_scale, target_scale, root_widget=window)
+                        if window is getattr(self, "settings_window", None):
+                            self._refresh_settings_checkbox_images(target_scale)
+                        elif window is getattr(self, "about_window", None):
+                            try:
+                                logo_path = get_resource("images/icon.png")
+                                if logo_path:
+                                    raw_logo = Image.open(logo_path).convert("RGBA")
+                                    logo_sz = max(1, int(round(64 * target_scale)))
+                                    old_logo = getattr(self, "_about_logo_img", None)
+                                    self._about_logo_img = ImageTk.PhotoImage(
+                                        raw_logo.resize((logo_sz, logo_sz), Image.Resampling.LANCZOS))
+                                    self._replace_widget_image(window, old_logo, self._about_logo_img)
+                            except Exception:
+                                pass
+                    finally:
+                        scaling_factor = saved_sf
+                        if self.root is not None:
+                            self.root.scaling_factor = saved_sf
+                    window._ui_applied_scale = target_scale
+
+                window.update_idletasks()
+                base_c = window._ui_base_client_size
+                if base_c is not None:
+                    desired_w = max(window.winfo_reqwidth(), int(round(base_c[0] * target_scale)))
+                    desired_h = max(window.winfo_reqheight(), int(round(base_c[1] * target_scale)))
+                    if window is getattr(self, "settings_window", None):
+                        desired_w = max(int(round(360 * target_scale)), window.winfo_reqwidth())
+                        desired_h = window.winfo_reqheight()
+                else:
+                    desired_w = max(1, window.winfo_reqwidth())
+                    desired_h = max(1, window.winfo_reqheight())
+
+                if dragging and scale_diff:
+                    prelim = _fit_window_to_work_area(
+                        monitor, desired_w, desired_h, hwnd=hwnd,
+                        x=outer_rect[0], y=outer_rect[1], clamp_position=False)
+                    tx, ty = _cursor_anchored_drag_position(
+                        outer_rect, prelim["outer_width"], prelim["outer_height"])
+                    fitted = _fit_window_to_work_area(
+                        monitor, desired_w, desired_h, hwnd=hwnd,
+                        x=tx, y=ty, clamp_position=False)
+                else:
+                    fitted = _fit_window_to_work_area(
+                        monitor, desired_w, desired_h, hwnd=hwnd,
+                        x=outer_rect[0], y=outer_rect[1],
+                        clamp_position=not dragging)
+
+                window.geometry(
+                    f"{fitted['client_width']}x{fitted['client_height']}"
+                    f"+{fitted['x']}+{fitted['y']}")
+                win32gui.SetWindowPos(
+                    int(hwnd), 0, fitted["x"], fitted["y"],
+                    fitted["outer_width"], fitted["outer_height"],
+                    win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
+                window.update_idletasks()
+                if dragging:
+                    window._ui_drag_clamp_after_id = window.after(
+                        100, self._finish_toplevel_post_drag_clamp, window)
+            finally:
+                window._ui_scale_busy = False
+        except Exception:
+            logger.debug("Toplevel monitor scale check failed", exc_info=True)
 
     def _queue_monitor_scale_check(self, delay=80):
         if not getattr(self, "root", None) or getattr(self, "is_quitting", False):
@@ -3847,10 +4219,10 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
             hwnd = _top_level_hwnd(self.root)
             if not hwnd:
                 raise RuntimeError("Could not resolve Tk top-level HWND")
-            rect = win32gui.GetWindowRect(hwnd)
             self.root.geometry(f"{client_width}x{client_height}")
-            win32gui.MoveWindow(
-                hwnd, rect[0], rect[1], outer_width, outer_height, True)
+            win32gui.SetWindowPos(
+                int(hwnd), 0, 0, 0, outer_width, outer_height,
+                win32con.SWP_NOMOVE | win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
             self.root.update_idletasks()
             applied = win32gui.GetWindowRect(hwnd)
             logger.info(
@@ -3858,6 +4230,60 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
                 applied[2] - applied[0], applied[3] - applied[1])
         except Exception:
             logger.exception("Failed to commit deferred dynamic window size")
+
+    def _schedule_post_drag_clamp(self):
+        if not getattr(self, "root", None) or getattr(self, "is_quitting", False):
+            return
+        try:
+            if self._post_drag_clamp_after_id is not None:
+                self.root.after_cancel(self._post_drag_clamp_after_id)
+            self._post_drag_clamp_after_id = self.root.after(
+                100, self._finish_post_drag_work_area_clamp)
+        except tk.TclError:
+            self._post_drag_clamp_after_id = None
+
+    def _finish_post_drag_work_area_clamp(self):
+        self._post_drag_clamp_after_id = None
+        if getattr(self, "is_quitting", False) or not getattr(self, "root", None):
+            return
+        if _is_mouse_dragging():
+            self._schedule_post_drag_clamp()
+            return
+        # First let monitor scaling settle if drag ended on a different display.
+        self._apply_monitor_scaling_if_needed()
+        if self._dynamic_scale_in_progress:
+            return
+        try:
+            hwnd = _top_level_hwnd(self.root)
+            if not hwnd or self.root.state() != "normal":
+                return
+            monitor = _monitor_metrics_from_window(hwnd)
+            if not monitor:
+                return
+            client_size = self._dpi_independent_client_size
+            if not client_size:
+                return
+            rect = win32gui.GetWindowRect(int(hwnd))
+            fitted = _fit_window_to_work_area(
+                monitor, client_size[0], client_size[1], hwnd=hwnd,
+                x=rect[0], y=rect[1], clamp_position=True)
+            if (fitted["x"] != rect[0] or fitted["y"] != rect[1]
+                    or (rect[2] - rect[0]) != fitted["outer_width"]
+                    or (rect[3] - rect[1]) != fitted["outer_height"]):
+                self.root.geometry(
+                    f"{fitted['client_width']}x{fitted['client_height']}"
+                    f"+{fitted['x']}+{fitted['y']}")
+                win32gui.SetWindowPos(
+                    int(hwnd), 0, fitted["x"], fitted["y"],
+                    fitted["outer_width"], fitted["outer_height"],
+                    win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
+                self.root.update_idletasks()
+                applied = win32gui.GetWindowRect(int(hwnd))
+                self._dpi_independent_outer_position = (applied[0], applied[1])
+                self._dpi_independent_outer_size = (
+                    applied[2] - applied[0], applied[3] - applied[1])
+        except Exception:
+            logger.debug("Post-drag work area clamp failed", exc_info=True)
 
     def _restore_dpi_independent_window_size(self, expected_dpi=None):
         """Undo Windows' automatic WM_DPICHANGED top-level window resize."""
@@ -3870,34 +4296,27 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
             if expected_dpi is not None and _get_window_dpi(hwnd) != expected_dpi:
                 return
             client_size = self._dpi_independent_client_size
-            outer_size = self._dpi_independent_outer_size
             outer_position = self._dpi_independent_outer_position
-            if not client_size or not outer_size or not outer_position:
+            if not client_size or not outer_position:
                 return
             monitor = _monitor_metrics_from_window(hwnd)
+            dragging = _is_mouse_dragging()
             current_outer = win32gui.GetWindowRect(hwnd)
-            current_client = win32gui.GetClientRect(hwnd)
-            non_client_height = max(
-                0, (current_outer[3] - current_outer[1])
-                - (current_client[3] - current_client[1]))
-            target_outer_width = int(outer_size[0])
-            target_outer_height = int(outer_size[1])
-            target_x, target_y = outer_position
-            if monitor:
-                target_outer_height = min(
-                    target_outer_height, monitor["work_height"])
-                if target_outer_width <= monitor["work_width"]:
-                    target_x = min(
-                        max(target_x, monitor["work_left"]),
-                        monitor["work_right"] - target_outer_width)
-                target_y = min(
-                    max(target_y, monitor["work_top"]),
-                    monitor["work_bottom"] - target_outer_height)
-            target_client_height = max(
-                1, target_outer_height - non_client_height)
-            self.root.minsize(client_size[0], target_client_height)
+            pos_x = current_outer[0] if dragging else outer_position[0]
+            pos_y = current_outer[1] if dragging else outer_position[1]
+            fitted = _fit_window_to_work_area(
+                monitor, client_size[0], client_size[1], hwnd=hwnd,
+                x=pos_x, y=pos_y, clamp_position=not dragging)
+            target_client_width = fitted["client_width"]
+            target_client_height = fitted["client_height"]
+            target_outer_width = fitted["outer_width"]
+            target_outer_height = fitted["outer_height"]
+            target_x = fitted["x"]
+            target_y = fitted["y"]
+            self.root.tk.call('tk', 'scaling', 1.3333333333333333)
+            self.root.minsize(target_client_width, target_client_height)
             self.root.geometry(
-                f"{client_size[0]}x{target_client_height}"
+                f"{target_client_width}x{target_client_height}"
                 f"+{int(target_x)}+{int(target_y)}")
             win32gui.SetWindowPos(
                 int(hwnd), 0, int(target_x), int(target_y),
@@ -3907,14 +4326,16 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
             applied = win32gui.GetWindowRect(hwnd)
             logger.info(
                 "DPI-only window size restored: dpi=%s client=%dx%d "
-                "outer=%dx%d", expected_dpi, client_size[0], target_client_height,
+                "outer=%dx%d", expected_dpi, target_client_width, target_client_height,
                 applied[2] - applied[0], applied[3] - applied[1])
             self._dpi_independent_client_size = (
-                client_size[0], target_client_height)
+                target_client_width, target_client_height)
             self._dpi_independent_outer_size = (
                 applied[2] - applied[0], applied[3] - applied[1])
             self._dpi_independent_outer_position = (
                 applied[0], applied[1])
+            if dragging:
+                self._schedule_post_drag_clamp()
         except Exception:
             logger.exception("Failed to restore DPI-independent window size")
 
@@ -3934,12 +4355,17 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
             previous_dpi = self._ui_window_dpi
             signature = _monitor_work_signature(monitor)
             scale_changed = signature != self._ui_monitor_signature
+            prev_eff_height = (
+                _effective_screen_height(
+                    self._ui_monitor_signature[0], self._ui_monitor_signature[1])
+                if self._ui_monitor_signature is not None else None
+            )
             dpi_only_changed = (
                 current_dpi is not None
                 and previous_dpi is not None
                 and current_dpi != previous_dpi
-                and self._ui_monitor_signature is not None
-                and monitor["height"] == self._ui_monitor_signature[1]
+                and prev_eff_height is not None
+                and monitor["effective_height"] == prev_eff_height
             )
             logger.info(
                 "Monitor scale check: widget_hwnd=%s top_hwnd=%s monitor=%s "
@@ -3952,8 +4378,8 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
             self._ui_window_dpi = current_dpi
             if dpi_only_changed:
                 # A DPI change can also alter rcWork by changing the native
-                # taskbar thickness.  Resolution is still identical, so this
-                # must win over the work-area signature comparison.
+                # taskbar thickness.  Effective resolution is still identical,
+                # so this must win over the work-area signature comparison.
                 logger.info(
                     "DPI-only change detected: %s -> %s; preserving app size",
                     previous_dpi, current_dpi)
@@ -3976,17 +4402,17 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
                 return
 
             old_scale = float(scaling_factor)
-            refresh_ui_scaling(monitor["height"], monitor["work_height"])
+            refresh_ui_scaling(monitor["effective_height"], monitor["work_height"])
             new_scale = float(scaling_factor)
             content_scale_changed = abs(new_scale - old_scale) >= 0.0001
 
             self._dynamic_scale_in_progress = True
             if content_scale_changed:
                 logger.info(
-                    "Display change detected: %sp work area %sp; "
+                    "Display change detected: %sp (raw %dx%d) work area %sp; "
                     "UI scale %.4f -> %.4f",
-                    monitor["height"], monitor["work_height"],
-                    old_scale, new_scale)
+                    monitor["effective_height"], monitor["width"], monitor["height"],
+                    monitor["work_height"], old_scale, new_scale)
                 self._rescale_widget_tree(old_scale, new_scale)
                 self._refresh_resolution_scaled_images()
             else:
@@ -3996,6 +4422,8 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
 
             if content_scale_changed:
                 self.force_refresh_player_slots()
+            self.root.configure(
+                padx=int(8 * scaling_factor), pady=int(6 * scaling_factor))
             self.root.update_idletasks()
             formula_width = int(
                 BASE_WINDOW_WIDTH * window_resolution_ratio
@@ -4008,10 +4436,22 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
             # synchronously resize the native top-level HWND as well.  The window
             # procedure deliberately does not override WM_WINDOWPOSCHANGING; doing
             # so would lock the window to its previous display's outer dimensions.
+            dragging = _is_mouse_dragging()
             outer_rect = win32gui.GetWindowRect(int(hwnd))
-            fitted = _fit_window_to_work_area(
-                monitor, width, desired_height, hwnd=hwnd,
-                x=outer_rect[0], y=outer_rect[1])
+            if dragging and content_scale_changed:
+                prelim = _fit_window_to_work_area(
+                    monitor, width, desired_height, hwnd=hwnd,
+                    x=outer_rect[0], y=outer_rect[1], clamp_position=False)
+                drag_x, drag_y = _cursor_anchored_drag_position(
+                    outer_rect, prelim["outer_width"], prelim["outer_height"])
+                fitted = _fit_window_to_work_area(
+                    monitor, width, desired_height, hwnd=hwnd,
+                    x=drag_x, y=drag_y, clamp_position=False)
+            else:
+                fitted = _fit_window_to_work_area(
+                    monitor, width, desired_height, hwnd=hwnd,
+                    x=outer_rect[0], y=outer_rect[1],
+                    clamp_position=not dragging)
             width = fitted["client_width"]
             height = fitted["client_height"]
             target_outer_width = fitted["outer_width"]
@@ -4024,15 +4464,13 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
                 fitted["x"], fitted["y"],
                 target_outer_width, target_outer_height,
                 win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
-            self.root.configure(
-                padx=int(10 * scaling_factor), pady=int(10 * scaling_factor))
             self.root.update_idletasks()
 
             applied_rect = win32gui.GetWindowRect(int(hwnd))
             applied_width = applied_rect[2] - applied_rect[0]
             applied_height = applied_rect[3] - applied_rect[1]
-            if (applied_width != target_outer_width
-                    or applied_height != target_outer_height):
+            if (not dragging and (applied_width != target_outer_width
+                    or applied_height != target_outer_height)):
                 # MoveWindow is a deliberately independent fallback for window
                 # managers/Tk builds that coalesce the preceding SetWindowPos.
                 win32gui.MoveWindow(
@@ -4044,9 +4482,9 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
                 applied_height = applied_rect[3] - applied_rect[1]
             logger.info(
                 "Dynamic window resize: client=%dx%d outer_target=%dx%d "
-                "outer_applied=%dx%d state=%s",
+                "outer_applied=%dx%d dragging=%s state=%s",
                 width, height, target_outer_width, target_outer_height,
-                applied_width, applied_height, self.root.state())
+                applied_width, applied_height, dragging, self.root.state())
             self._dpi_independent_client_size = (width, height)
             self._dpi_independent_outer_size = (
                 applied_width, applied_height)
@@ -4054,15 +4492,18 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
                 applied_rect[0], applied_rect[1])
             self._ui_window_dpi = current_dpi
 
-            self.content_canvas.itemconfigure(
-                self._scroll_content_window,
-                width=max(self.content_canvas.winfo_width(),
-                          self._measure_scroll_content_width()))
-            self.root.after_idle(self._update_content_scrollregion)
+            if getattr(self, "content_canvas", None) is not None:
+                self.content_canvas.itemconfigure(
+                    self._scroll_content_window,
+                    width=max(self.content_canvas.winfo_width(),
+                              self._measure_scroll_content_width()))
+                self.root.after_idle(self._update_content_scrollregion)
             self.root.after(
                 0, self._commit_dynamic_window_size,
                 monitor["handle"], width, height,
                 target_outer_width, target_outer_height)
+            if dragging:
+                self._schedule_post_drag_clamp()
         except Exception:
             logger.exception("Failed to apply dynamic monitor UI scaling")
         finally:
@@ -7942,7 +8383,15 @@ bg_color=panel_bg, widths=[8, 10])
         self._populate_edit_profiles_dialog(dialog, owner=owner)
         dialog.protocol("WM_DELETE_WINDOW", close_dialog)
 
-    def _populate_edit_profiles_dialog(self, dialog, owner=None):
+    def _populate_edit_profiles_dialog(self, dialog, owner=None, preserve_position=None, clamp_position=True):
+        old_outer_rect = None
+        if preserve_position is not None and sys.platform == "win32":
+            try:
+                tl_hwnd = _top_level_hwnd(dialog)
+                if tl_hwnd:
+                    old_outer_rect = win32gui.GetWindowRect(int(tl_hwnd))
+            except Exception:
+                old_outer_rect = None
         for w in dialog.winfo_children():
             w.destroy()
 
@@ -7951,7 +8400,7 @@ bg_color=panel_bg, widths=[8, 10])
 
         self._edit_dialog_icons = []
         self._edit_dialog_cards = []
-        scaling_factor = getattr(self, "scaling_factor", 1.0)
+        scaling_factor = float(getattr(dialog, "_ui_applied_scale", None) or getattr(self, "scaling_factor", 1.0))
         row_height = int(66 * scaling_factor)
         card_w = int(486 * scaling_factor)
         card_r = int(16 * scaling_factor)
@@ -8149,6 +8598,29 @@ bg_color=panel_bg, widths=[8, 10])
         content_w = int(520 * scaling_factor)
         needed_h = scrollable.winfo_reqheight() + finish_frame.winfo_reqheight() + header_frame.winfo_reqheight() + int(36 * scaling_factor)
         content_h = min(int(490 * scaling_factor), max(int(220 * scaling_factor), needed_h))
+        if preserve_position is not None and sys.platform == "win32":
+            tl_hwnd = _top_level_hwnd(dialog)
+            mon = _monitor_metrics_from_window(tl_hwnd) if tl_hwnd else None
+            px, py = int(preserve_position[0]), int(preserve_position[1])
+            if not clamp_position and old_outer_rect is not None:
+                prelim = _fit_window_to_work_area(
+                    mon, content_w, content_h, hwnd=tl_hwnd,
+                    x=px, y=py, clamp_position=False)
+                px, py = _cursor_anchored_drag_position(
+                    old_outer_rect, prelim["outer_width"], prelim["outer_height"])
+            fitted = _fit_window_to_work_area(
+                mon, content_w, content_h, hwnd=tl_hwnd,
+                x=px, y=py, clamp_position=clamp_position)
+            dialog.geometry(
+                f"{fitted['client_width']}x{fitted['client_height']}"
+                f"+{fitted['x']}+{fitted['y']}")
+            if tl_hwnd:
+                win32gui.SetWindowPos(
+                    int(tl_hwnd), 0, fitted["x"], fitted["y"],
+                    fitted["outer_width"], fitted["outer_height"],
+                    win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
+            dialog.update_idletasks()
+            return
         self.center_window_on_root(dialog, content_w, content_h, owner=owner)
         dialog.deiconify()
         dialog.lift(owner)
@@ -10626,8 +11098,12 @@ bg_color=panel_bg, widths=[8, 10])
             self.right_column.pack_forget()
         if hasattr(self, "left_column"):
             self.left_column.pack_configure(padx=0)
+            self._dynamic_widget_baselines.pop(self.left_column, None)
+        if hasattr(self, "right_column"):
+            self._dynamic_widget_baselines.pop(self.right_column, None)
         if hasattr(self, "center_cluster"):
             self.center_cluster.place_configure(relx=0.5, rely=0.5, anchor=tk.CENTER, x=0)
+            self._dynamic_widget_baselines.pop(self.center_cluster, None)
         if hasattr(self, "main_frame") and self.main_frame.winfo_exists():
             if not any(isinstance(w, tk.Label) and w.cget("text").startswith("Press button") for w in self.main_frame.winfo_children()):
                 for w in self.main_frame.winfo_children():
@@ -10656,10 +11132,12 @@ bg_color=panel_bg, widths=[8, 10])
                 pass
             self._slide_animation_id = None
 
-        scaling_factor = getattr(self, "scaling_factor", 1.0)
-        pad_gap = int(22 * scaling_factor)
+        pad_gap = int(22 * self.scaling_factor)
         self.left_column.pack_configure(padx=(0, pad_gap))
         self.right_column.pack(side=tk.LEFT, padx=(pad_gap, 0))
+        self._dynamic_widget_baselines.pop(self.left_column, None)
+        self._dynamic_widget_baselines.pop(self.right_column, None)
+        self._dynamic_widget_baselines.pop(self.center_cluster, None)
         self.root.update_idletasks()
 
         r_width = self.right_column.winfo_reqwidth()

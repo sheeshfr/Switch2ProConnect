@@ -110,11 +110,23 @@ class CalibrationOverlay:
         self.window.attributes("-alpha", 0.95)
         self.window.configure(bg="#1c1c1e")
         
-        screen_width = self.window.winfo_screenwidth()
-        screen_height = self.window.winfo_screenheight()
         w, h = int(500 * scaling_factor), int(110 * scaling_factor)
-        x = screen_width - w - int(30 * scaling_factor)
-        y = screen_height - h - int(70 * scaling_factor) # Bottom-right, staying above the taskbar
+        monitor = None
+        try:
+            import gui as _gui_mod
+            hwnd = _gui_mod._top_level_hwnd(self.root)
+            monitor = _gui_mod._monitor_metrics_from_window(hwnd) if hwnd else None
+        except Exception:
+            monitor = None
+        if monitor:
+            w = min(w, max(200, monitor["work_width"] - int(20 * scaling_factor)))
+            x = monitor["work_right"] - w - int(20 * scaling_factor)
+            y = monitor["work_bottom"] - h - int(20 * scaling_factor)
+        else:
+            screen_width = self.window.winfo_screenwidth()
+            screen_height = self.window.winfo_screenheight()
+            x = screen_width - w - int(30 * scaling_factor)
+            y = screen_height - h - int(70 * scaling_factor) # Bottom-right, staying above the taskbar
         self.window.geometry(f"{w}x{h}+{x}+{y}")
         
         frame = tk.Frame(self.window, bg="#1c1c1e", highlightbackground="#3a3a3c", highlightthickness=2, bd=0)
@@ -203,10 +215,23 @@ class CalibrationOverlay:
             self.profile_window.update_idletasks()
             w = max(target_w, self.profile_window.winfo_reqwidth(), int(name_px) + int(40 * scaling_factor))
             h = self.profile_window.winfo_reqheight()
-            sw = self.profile_window.winfo_screenwidth()
-            sh = self.profile_window.winfo_screenheight()
-            x = sw - w - int(30 * scaling_factor)
-            y = sh - h - int(70 * scaling_factor)
+            monitor = None
+            try:
+                import gui as _gui_mod
+                hwnd = _gui_mod._top_level_hwnd(self.root)
+                monitor = _gui_mod._monitor_metrics_from_window(hwnd) if hwnd else None
+            except Exception:
+                monitor = None
+            if monitor:
+                w = min(w, max(200, monitor["work_width"] - int(20 * scaling_factor)))
+                x = monitor["work_right"] - w - int(20 * scaling_factor)
+                y = monitor["work_bottom"] - h - int(20 * scaling_factor)
+            else:
+                sw = self.profile_window.winfo_screenwidth()
+                sh = self.profile_window.winfo_screenheight()
+                x = sw - w - int(30 * scaling_factor)
+                y = sh - h - int(70 * scaling_factor)
+            self.window_pos = (x, y)
             self.profile_window.geometry(f"{w}x{h}+{x}+{y}")
         else:
             self._profile_prev_lbl.config(text=prev_name or " ")
@@ -365,7 +390,7 @@ class JoystickCalibrationWizard:
 
     def _center_window(self):
         self.window.update_idletasks()
-        sf = getattr(self.root, "scaling_factor", 1.0)
+        sf = float(getattr(self.root, "scaling_factor", scaling_factor) or scaling_factor)
         w = max(int(450 * sf), self.window.winfo_reqwidth())
         h = max(int(230 * sf), self.window.winfo_reqheight())
         try:
@@ -587,7 +612,7 @@ class MagnetometerCalibrationWizard:
 
         apply_window_dark_theme_and_icon(self.window, background_color)
 
-        sf = getattr(root, "scaling_factor", 1.0)
+        sf = float(getattr(root, "scaling_factor", scaling_factor) or scaling_factor)
         self.frame = tk.Frame(self.window, bg=background_color, padx=int(20 * sf), pady=int(16 * sf))
         self.frame.pack(fill="both", expand=True)
 
@@ -677,7 +702,7 @@ class MagnetometerCalibrationWizard:
 
     def _center_window(self):
         self.window.update_idletasks()
-        sf = getattr(self.root, "scaling_factor", 1.0)
+        sf = float(getattr(self.root, "scaling_factor", scaling_factor) or scaling_factor)
         w = max(int(440 * sf), self.window.winfo_reqwidth())
         h = max(int(220 * sf), self.window.winfo_reqheight())
         try:
@@ -780,7 +805,7 @@ class GyroCalibrationWizard:
 
         apply_window_dark_theme_and_icon(self.window, background_color)
 
-        sf = getattr(root, "scaling_factor", 1.0)
+        sf = float(getattr(root, "scaling_factor", scaling_factor) or scaling_factor)
         self.frame = tk.Frame(self.window, bg=background_color, padx=int(20 * sf), pady=int(16 * sf))
         self.frame.pack(fill="both", expand=True)
 
@@ -854,7 +879,7 @@ class GyroCalibrationWizard:
 
     def _center_window(self):
         self.window.update_idletasks()
-        sf = getattr(self.root, "scaling_factor", 1.0)
+        sf = float(getattr(self.root, "scaling_factor", scaling_factor) or scaling_factor)
         w = max(int(440 * sf), self.window.winfo_reqwidth())
         h = max(int(230 * sf), self.window.winfo_reqheight())
         try:

@@ -325,6 +325,15 @@ def apply_window_dark_theme_and_icon(window, bg_color=None):
         window.after(30, _apply_dwm)
     except Exception:
         pass
+    if sys.platform == "win32":
+        try:
+            if isinstance(window, tk.Toplevel):
+                import gui as _gui_mod
+                inst = getattr(_gui_mod.ControllerWindow, "_current_instance", None)
+                if inst is not None and hasattr(inst, "_attach_toplevel_dpi_scaler"):
+                    inst._attach_toplevel_dpi_scaler(window)
+        except Exception:
+            pass
 
 _ROUNDED_RECT_CACHE = {}
 
@@ -428,9 +437,23 @@ def make_rounded_button(parent, text="", command=None, width=100, height=32, rad
     btn.rounded_h = h
     btn.rounded_r = r
     btn.rounded_bg = bg_color
+    btn.rounded_hover = hover_color
+    btn.rounded_press = press_color
     btn.rounded_parent_bg = parent_bg
     btn.icon_image = icon_image
     btn.icon_size = icon_size
+    btn._rounded_spec = {
+        "base_w": float(width),
+        "base_h": float(height),
+        "base_r": float(radius),
+        "pill_radius": False,
+        "bg": bg_color,
+        "hover": hover_color,
+        "press": press_color,
+        "parent_bg": parent_bg,
+        "icon_image": icon_image,
+        "icon_size": tuple(icon_size) if icon_size else None,
+    }
 
     def on_enter(e):
         try:
@@ -480,16 +503,80 @@ def set_rounded_button_bg(btn, bg_color, hover_color=None, press_color=None):
         return
     w, h, r = btn.rounded_w, btn.rounded_h, btn.rounded_r
     parent_bg = getattr(btn, "rounded_parent_bg", background_color)
-    if hover_color is None:
-        hover_color = bg_color
-    if press_color is None:
-        press_color = bg_color
-    btn.image_normal = get_rounded_rect_image(w, h, r, bg_color, parent_bg=parent_bg)
-    btn.image_hover = get_rounded_rect_image(w, h, r, hover_color, parent_bg=parent_bg)
-    btn.image_press = get_rounded_rect_image(w, h, r, press_color, parent_bg=parent_bg)
+    spec = getattr(btn, "_rounded_spec", None)
+    icon_img = spec.get("icon_image") if spec else getattr(btn, "icon_image", None)
+    raw_icon_size = spec.get("icon_size") if spec else getattr(btn, "icon_size", None)
+    sf_now = float(scaling_factor) if float(scaling_factor) > 0 else 1.0
+    scaled_icon_size = (
+        (max(1, int(round(raw_icon_size[0] * sf_now))), max(1, int(round(raw_icon_size[1] * sf_now))))
+        if raw_icon_size else None
+    )
+    eff_hover = hover_color if hover_color is not None else (spec["hover"] if (spec and bg_color == spec.get("bg")) else bg_color)
+    eff_press = press_color if press_color is not None else (spec["press"] if (spec and bg_color == spec.get("bg")) else bg_color)
+    parent = getattr(btn, "master", None)
+    btn.image_normal = get_rounded_rect_image(w, h, r, bg_color, parent_bg=parent_bg, icon_img=icon_img, icon_size=scaled_icon_size, parent=parent)
+    btn.image_hover = get_rounded_rect_image(w, h, r, eff_hover, parent_bg=parent_bg, icon_img=icon_img, icon_size=scaled_icon_size, parent=parent)
+    btn.image_press = get_rounded_rect_image(w, h, r, eff_press, parent_bg=parent_bg, icon_img=icon_img, icon_size=scaled_icon_size, parent=parent)
     btn.rounded_bg = bg_color
+    btn.rounded_hover = eff_hover
+    btn.rounded_press = eff_press
+    if spec is not None and hover_color is not None:
+        spec["bg"] = bg_color
+        spec["hover"] = eff_hover
+        spec["press"] = eff_press
     try:
         btn.config(image=btn.image_normal)
+    except Exception:
+        pass
+
+
+def rescale_rounded_widget(widget, new_scale):
+    spec = getattr(widget, "_rounded_spec", None)
+    if not spec or new_scale <= 0:
+        return
+    w = max(1, int(round(spec["base_w"] * new_scale)))
+    h = max(1, int(round(spec["base_h"] * new_scale)))
+    if spec.get("pill_radius"):
+        r = max(1, h // 2)
+    else:
+        r = max(1, int(round(spec["base_r"] * new_scale)))
+    icon_size = spec.get("icon_size")
+    scaled_icon_size = (
+        (max(1, int(round(icon_size[0] * new_scale))),
+         max(1, int(round(icon_size[1] * new_scale))))
+        if icon_size else None
+    )
+    parent = getattr(widget, "master", None)
+    parent_bg = spec.get("parent_bg", background_color)
+    icon_img = spec.get("icon_image")
+    img_normal = get_rounded_rect_image(
+        w, h, r, spec["bg"], parent_bg=parent_bg,
+        icon_img=icon_img, icon_size=scaled_icon_size, parent=parent)
+    img_hover = get_rounded_rect_image(
+        w, h, r, spec["hover"], parent_bg=parent_bg,
+        icon_img=icon_img, icon_size=scaled_icon_size, parent=parent)
+    img_press = get_rounded_rect_image(
+        w, h, r, spec["press"], parent_bg=parent_bg,
+        icon_img=icon_img, icon_size=scaled_icon_size, parent=parent)
+    widget.rounded_w = w
+    widget.rounded_h = h
+    widget.rounded_r = r
+    widget.image_normal = img_normal
+    widget.image_hover = img_hover
+    widget.image_press = img_press
+    if hasattr(widget, "_img_normal"):
+        widget._img_normal = img_normal
+        widget._img_hover = img_hover
+        widget._img_press = img_press
+    if hasattr(widget, "_fnt"):
+        try:
+            widget._fnt = tkFont.Font(font=widget.cget("font"))
+            widget._char_px = widget._fnt.measure("0") or 1
+            widget._min_chars = max(1, widget._fit_chars("Waiting..."))
+        except Exception:
+            pass
+    try:
+        widget.config(image=img_normal)
     except Exception:
         pass
 
@@ -612,12 +699,38 @@ class RecordingEntry(tk.Text):
         self.is_custom_recording_entry = True
         self.tag_configure("normal", font=normal_font, justify="center")
         self.tag_configure("prefix", font=prefix_font, justify="center")
+        sf_now = float(scaling_factor) if float(scaling_factor) > 0 else 1.0
+        self._font_baselines = {}
+        for tag_name, f_spec in (("normal", normal_font), ("prefix", prefix_font)):
+            if isinstance(f_spec, (tuple, list)) and len(f_spec) >= 2:
+                try:
+                    sz = int(f_spec[1])
+                    self._font_baselines[tag_name] = (list(f_spec), abs(sz) / sf_now, -1 if sz < 0 else 1)
+                except (TypeError, ValueError):
+                    pass
         self.bindtags(tuple(t for t in self.bindtags() if t != "Text"))
         # tk.Text top-aligns its single line; when fill=Y stretches it to the row height,
         # split the leftover space into equal top/bottom padding so the text is centered.
         self._line_font = tkFont.Font(font=normal_font)
         self._applied_pady = -1
         self.bind("<Configure>", self._recenter, add="+")
+
+    def rescale_fonts(self, new_scale):
+        if new_scale <= 0:
+            return
+        for tag_name, (parts, base_sz, sign) in self._font_baselines.items():
+            new_parts = list(parts)
+            new_parts[1] = sign * max(1, int(round(base_sz * new_scale)))
+            new_font = tuple(new_parts)
+            try:
+                self.tag_configure(tag_name, font=new_font, justify="center")
+                if tag_name == "normal":
+                    super().configure(font=new_font)
+                    self._line_font = tkFont.Font(font=new_font)
+            except Exception:
+                pass
+        self._applied_pady = -1
+        self._recenter()
 
     def _recenter(self, event=None):
         try:
@@ -765,20 +878,41 @@ class BackButtonSelector(tk.Button):
         self._min_chars = max(1, self._fit_chars("Waiting..."))
         self._fixed_size = fixed_size
 
+        sf_now = float(scaling_factor) if float(scaling_factor) > 0 else 1.0
+        base_w = (fixed_size[0] / sf_now) if fixed_size else 100.0
+        base_h = (fixed_size[1] / sf_now) if fixed_size else 32.0
+        parent_bg = getattr(parent, "cget", lambda k: background_color)("bg") if parent is not None else background_color
+
         btn_w = fixed_size[0] if fixed_size else int(100 * scaling_factor)
         btn_h = fixed_size[1] if fixed_size else int(32 * scaling_factor)
         btn_r = int(6 * scaling_factor)
 
-        self._img_normal = get_rounded_rect_image(btn_w, btn_h, btn_r, button_gray)
-        self._img_hover = get_rounded_rect_image(btn_w, btn_h, btn_r, "#4A4A4A")
-        self._img_press = get_rounded_rect_image(btn_w, btn_h, btn_r, "#2A2A2A")
+        self._img_normal = get_rounded_rect_image(btn_w, btn_h, btn_r, button_gray, parent_bg=parent_bg, parent=parent)
+        self._img_hover = get_rounded_rect_image(btn_w, btn_h, btn_r, "#4A4A4A", parent_bg=parent_bg, parent=parent)
+        self._img_press = get_rounded_rect_image(btn_w, btn_h, btn_r, "#2A2A2A", parent_bg=parent_bg, parent=parent)
 
         self.rounded_w = btn_w
         self.rounded_h = btn_h
         self.rounded_r = btn_r
+        self.rounded_bg = button_gray
+        self.rounded_hover = "#4A4A4A"
+        self.rounded_press = "#2A2A2A"
+        self.rounded_parent_bg = parent_bg
         self.image_normal = self._img_normal
         self.image_hover = self._img_hover
         self.image_press = self._img_press
+        self._rounded_spec = {
+            "base_w": float(base_w),
+            "base_h": float(base_h),
+            "base_r": 6.0,
+            "pill_radius": False,
+            "bg": button_gray,
+            "hover": "#4A4A4A",
+            "press": "#2A2A2A",
+            "parent_bg": parent_bg,
+            "icon_image": None,
+            "icon_size": None,
+        }
 
         super().__init__(
             parent,
@@ -787,8 +921,8 @@ class BackButtonSelector(tk.Button):
             compound=tk.CENTER,
             font=self._font,
             fg="white",
-            bg=background_color,
-            activebackground=background_color,
+            bg=parent_bg,
+            activebackground=parent_bg,
             activeforeground="white",
             relief=tk.FLAT,
             bd=0,
@@ -869,8 +1003,10 @@ class ProfileBackButtonSelector(BackButtonSelector):
         self._button_key = key          # "gl" or "gr"
         self._gui = gui
 
-        sf = getattr(gui, "scaling_factor", 1.0)
+        sf = float(getattr(gui, "scaling_factor", scaling_factor) or 1.0)
         size = fixed_size or (int(76 * sf), int(28 * sf))
+        base_w = (fixed_size[0] / sf) if fixed_size else 76.0
+        base_h = (fixed_size[1] / sf) if fixed_size else 28.0
         btn_w, btn_h = size
         btn_r = max(1, btn_h // 2)
 
@@ -893,6 +1029,22 @@ class ProfileBackButtonSelector(BackButtonSelector):
         self.image_hover = self._img_hover
         self.image_press = self._img_press
         self.rounded_r = btn_r
+        self.rounded_bg = dark_bg
+        self.rounded_hover = dark_hover
+        self.rounded_press = dark_press
+        self.rounded_parent_bg = "#3A3A3A"
+        self._rounded_spec = {
+            "base_w": float(base_w),
+            "base_h": float(base_h),
+            "base_r": max(1.0, float(base_h) / 2.0),
+            "pill_radius": True,
+            "bg": dark_bg,
+            "hover": dark_hover,
+            "press": dark_press,
+            "parent_bg": "#3A3A3A",
+            "icon_image": None,
+            "icon_size": None,
+        }
         self.config(image=self._img_normal, bg="#3A3A3A", activebackground="#3A3A3A", fg="white")
         self.set(current_val)
 

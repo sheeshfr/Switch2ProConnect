@@ -50,30 +50,64 @@ def update_toggle_button(*args, **kwargs):
     return gui.update_toggle_button(*args, **kwargs)
 
 class _ScalingProxy:
-    def __mul__(self, other):
-        import gui
-        return gui.scaling_factor * other
-    def __rmul__(self, other):
-        import gui
-        return other * gui.scaling_factor
-    def __int__(self):
-        import gui
-        return int(gui.scaling_factor)
-    def __float__(self):
+    def _val(self):
         import gui
         return float(gui.scaling_factor)
+    def __mul__(self, other):
+        return self._val() * other
+    def __rmul__(self, other):
+        return other * self._val()
+    def __int__(self):
+        return int(self._val())
+    def __float__(self):
+        return self._val()
+    def __str__(self):
+        return str(self._val())
 
 scaling_factor = _ScalingProxy()
 
 class _DynamicIntProxy:
     def __init__(self, attr_name):
         self.attr_name = attr_name
+    def _val(self):
+        import gui
+        return int(getattr(gui, self.attr_name))
     def __int__(self):
-        import gui
-        return int(getattr(gui, self.attr_name))
+        return self._val()
     def __index__(self):
-        import gui
-        return int(getattr(gui, self.attr_name))
+        return self._val()
+    def __float__(self):
+        return float(self._val())
+    def __str__(self):
+        return str(self._val())
+    def __repr__(self):
+        return str(self._val())
+    def __add__(self, other):
+        return self._val() + other
+    def __radd__(self, other):
+        return other + self._val()
+    def __sub__(self, other):
+        return self._val() - other
+    def __rsub__(self, other):
+        return other - self._val()
+    def __mul__(self, other):
+        return self._val() * other
+    def __rmul__(self, other):
+        return other * self._val()
+    def __floordiv__(self, other):
+        return self._val() // other
+    def __truediv__(self, other):
+        return self._val() / other
+    def __lt__(self, other):
+        return self._val() < other
+    def __le__(self, other):
+        return self._val() <= other
+    def __gt__(self, other):
+        return self._val() > other
+    def __ge__(self, other):
+        return self._val() >= other
+    def __eq__(self, other):
+        return self._val() == other
 
 player_led_width = _DynamicIntProxy("player_led_width")
 player_led_height = _DynamicIntProxy("player_led_height")
@@ -131,12 +165,7 @@ class MockVirtualController:
     def is_single_joycon_right(self):
         return self.ctype == "right"
 
-resolution_ratio = 1.0
-window_resolution_ratio = 1.0
-scaling_factor = 1.0
-ui_dpi = 120
-ui_dpi_scale = 1.25
-controller_frame_size = 180
+controller_frame_size = _DynamicIntProxy("controller_frame_size")
 
 class PlayerInfoBlock:
     def __init__(self, parent, window):
@@ -524,9 +553,12 @@ class PlayerInfoBlock:
         sf = getattr(self.window, "scaling_factor", 1.0)
         w = int(280 * sf)
         h = int(240 * sf)
-        x = self.window.root.winfo_x() + (self.window.root.winfo_width() // 2) - (w // 2)
-        y = self.window.root.winfo_y() + (self.window.root.winfo_height() // 2) - (h // 2)
-        dialog.geometry(f"{w}x{h}+{x}+{y}")
+        if hasattr(self.window, "center_window_on_root"):
+            self.window.center_window_on_root(dialog, w, h)
+        else:
+            x = self.window.root.winfo_x() + (self.window.root.winfo_width() // 2) - (w // 2)
+            y = self.window.root.winfo_y() + (self.window.root.winfo_height() // 2) - (h // 2)
+            dialog.geometry(f"{w}x{h}+{x}+{y}")
 
         title_lbl = tk.Label(
             dialog,
