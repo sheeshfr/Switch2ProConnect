@@ -31,40 +31,44 @@ logger = logging.getLogger(__name__)
 # WinUHid callback: doing so would hold the GIL and stall other controllers.
 
 # Load the DLLs
-try:
-    from config import get_driver_path, get_app_root
-    winuhid_path = get_driver_path("WinUHid.dll")
-    winuhid_devs_path = get_driver_path("WinUHidDevs.dll")
-    # Read-only A/B hook for isolating preset-library regressions without
-    # overwriting the installed/current DLL.  WinUHid.dll and the kernel driver
-    # are identical between the current tree and the 2.2 reference; only
-    # WinUHidDevs.dll differs.
-    winuhid_devs_override = os.environ.get("SWITCH2_WINUHID_DEVS_PATH")
-    if winuhid_devs_override:
-        winuhid_devs_override = os.path.abspath(winuhid_devs_override)
-        if not os.path.isfile(winuhid_devs_override):
-            raise FileNotFoundError(
-                f"SWITCH2_WINUHID_DEVS_PATH does not exist: {winuhid_devs_override}")
-        winuhid_devs_path = winuhid_devs_override
-    
-    if not os.path.exists(winuhid_path):
-        # Try WinUHid-main build directory
-        winuhid_path = os.path.join(get_app_root(), "WinUHid-main", "build", "Release", "x64", "WinUHid.dll")
-        winuhid_devs_path = os.path.join(get_app_root(), "WinUHid-main", "build", "Release", "x64", "WinUHidDevs.dll")
-        if not os.path.exists(winuhid_path):
-            winuhid_path = os.path.join(get_app_root(), "external", "WinUHid-main", "build", "Release", "x64", "WinUHid.dll")
-            winuhid_devs_path = os.path.join(get_app_root(), "external", "WinUHid-main", "build", "Release", "x64", "WinUHidDevs.dll")
-
-    # Load WinUHid.dll first
-    _winuhid = ctypes.CDLL(winuhid_path)
-    # Then load WinUHidDevs.dll
-    _winuhid_devs = ctypes.CDLL(winuhid_devs_path)
-    logger.info("Successfully loaded WinUHid DLLs (core=%s presets=%s)",
-                winuhid_path, winuhid_devs_path)
-except Exception as e:
-    logger.error(f"Failed to load WinUHid DLLs: {e}")
+if sys.platform != "win32":
     _winuhid = None
     _winuhid_devs = None
+else:
+    try:
+        from config import get_driver_path, get_app_root
+        winuhid_path = get_driver_path("WinUHid.dll")
+        winuhid_devs_path = get_driver_path("WinUHidDevs.dll")
+        # Read-only A/B hook for isolating preset-library regressions without
+        # overwriting the installed/current DLL.  WinUHid.dll and the kernel driver
+        # are identical between the current tree and the 2.2 reference; only
+        # WinUHidDevs.dll differs.
+        winuhid_devs_override = os.environ.get("SWITCH2_WINUHID_DEVS_PATH")
+        if winuhid_devs_override:
+            winuhid_devs_override = os.path.abspath(winuhid_devs_override)
+            if not os.path.isfile(winuhid_devs_override):
+                raise FileNotFoundError(
+                    f"SWITCH2_WINUHID_DEVS_PATH does not exist: {winuhid_devs_override}")
+            winuhid_devs_path = winuhid_devs_override
+        
+        if not os.path.exists(winuhid_path):
+            # Try WinUHid-main build directory
+            winuhid_path = os.path.join(get_app_root(), "WinUHid-main", "build", "Release", "x64", "WinUHid.dll")
+            winuhid_devs_path = os.path.join(get_app_root(), "WinUHid-main", "build", "Release", "x64", "WinUHidDevs.dll")
+            if not os.path.exists(winuhid_path):
+                winuhid_path = os.path.join(get_app_root(), "external", "WinUHid-main", "build", "Release", "x64", "WinUHid.dll")
+                winuhid_devs_path = os.path.join(get_app_root(), "external", "WinUHid-main", "build", "Release", "x64", "WinUHidDevs.dll")
+
+        # Load WinUHid.dll first
+        _winuhid = ctypes.CDLL(winuhid_path)
+        # Then load WinUHidDevs.dll
+        _winuhid_devs = ctypes.CDLL(winuhid_devs_path)
+        logger.info("Successfully loaded WinUHid DLLs (core=%s presets=%s)",
+                    winuhid_path, winuhid_devs_path)
+    except Exception as e:
+        logger.error(f"Failed to load WinUHid DLLs: {e}")
+        _winuhid = None
+        _winuhid_devs = None
 # Custom device structures for WinUHid.dll
 class GUID(ctypes.Structure):
     _pack_ = 1

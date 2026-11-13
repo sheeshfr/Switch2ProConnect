@@ -21,6 +21,9 @@ import sys
 import os
 import ctypes
 
+if __name__ == "__main__":
+    sys.modules.setdefault("gui", sys.modules["__main__"])
+
 # If running without console (noconsole), ensure sys.stdout and sys.stderr are valid
 # to prevent crashes from any module calling print() or logging to stderr
 if sys.stdout is None:
@@ -50,42 +53,75 @@ try:
     sys.excepthook = _app_excepthook
 except Exception:
     pass
-
-if __name__ == "__main__":
-    # Single-Instance Enforcement
-    _SINGLE_INSTANCE_MUTEX_NAME = "Global\\Switch2ProConnect_ShFr_UI_Mod_SingleInstance"
+if sys.platform != "win32":
     try:
-        kernel32 = ctypes.windll.kernel32
-        user32 = ctypes.windll.user32
-        ERROR_ALREADY_EXISTS = 183
-
-        _app_instance_mutex = kernel32.CreateMutexW(None, True, _SINGLE_INSTANCE_MUTEX_NAME)
-        if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
-            try:
-                msg_id = user32.RegisterWindowMessageW("Switch2ProConnect_ShowWindow_Message")
-                if msg_id:
-                    HWND_BROADCAST = 0xFFFF
-                    user32.PostMessageW(HWND_BROADCAST, msg_id, 0, 0)
-            except Exception:
-                pass
-
-            for title in (
-                "Switch 2 Pro Connect",
-                "Switch 2 Connect (ShFr UI Mod)",
-                "Switch 2 Connect (SheeshFr Modded)",
-                "Switch 2 Connect",
-            ):
-                hwnd = user32.FindWindowW(None, title)
-                if hwnd:
-                    user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-                    user32.SetForegroundWindow(hwnd)
-                    break
-
-            if _app_instance_mutex:
-                kernel32.CloseHandle(_app_instance_mutex)
-            sys.exit(0)
+        import linux_uinput
+        linux_uinput.install_win32_shims()
     except Exception:
         pass
+
+if __name__ == "__main__":
+    if sys.platform == "win32":
+        # Windows Single-Instance Enforcement
+        _SINGLE_INSTANCE_MUTEX_NAME = "Global\\Switch2ProConnect_ShFr_UI_Mod_SingleInstance"
+        try:
+            kernel32 = ctypes.windll.kernel32
+            user32 = ctypes.windll.user32
+            ERROR_ALREADY_EXISTS = 183
+
+            _app_instance_mutex = kernel32.CreateMutexW(None, True, _SINGLE_INSTANCE_MUTEX_NAME)
+            if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+                try:
+                    msg_id = user32.RegisterWindowMessageW("Switch2ProConnect_ShowWindow_Message")
+                    if msg_id:
+                        HWND_BROADCAST = 0xFFFF
+                        user32.PostMessageW(HWND_BROADCAST, msg_id, 0, 0)
+                except Exception:
+                    pass
+
+                for title in (
+                    "Switch 2 Pro Connect",
+                    "Switch 2 Connect (ShFr UI Mod)",
+                    "Switch 2 Connect (SheeshFr Modded)",
+                    "Switch 2 Connect",
+                ):
+                    hwnd = user32.FindWindowW(None, title)
+                    if hwnd:
+                        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                        user32.SetForegroundWindow(hwnd)
+                        break
+
+                if _app_instance_mutex:
+                    kernel32.CloseHandle(_app_instance_mutex)
+                sys.exit(0)
+        except Exception:
+            pass
+    else:
+        # Linux Single-Instance Enforcement via Unix Domain Socket
+        try:
+            import socket
+            sock_path = f"/tmp/switch2proconnect_{os.getuid()}.sock"
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                client.connect(sock_path)
+                client.sendall(b"SHOW\n")
+                client.close()
+                sys.exit(0)
+            except (ConnectionRefusedError, FileNotFoundError):
+                try:
+                    if os.path.exists(sock_path):
+                        os.unlink(sock_path)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            finally:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 import queue
 import time
@@ -192,51 +228,52 @@ from gui_listeners import (
 )
 
 # Explicitly set types for Win32 API to ensure compatibility
-ctypes.windll.shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
-ctypes.windll.shell32.ShellExecuteExW.restype = wintypes.BOOL
+if sys.platform == "win32":
+    ctypes.windll.shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
+    ctypes.windll.shell32.ShellExecuteExW.restype = wintypes.BOOL
 
-ctypes.windll.kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-ctypes.windll.kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    ctypes.windll.kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    ctypes.windll.kernel32.WaitForSingleObject.restype = wintypes.DWORD
 
-ctypes.windll.kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-ctypes.windll.kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    ctypes.windll.kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    ctypes.windll.kernel32.GetExitCodeProcess.restype = wintypes.BOOL
 
-ctypes.windll.user32.GetWindowPlacement.argtypes = [wintypes.HWND, ctypes.POINTER(WINDOWPLACEMENT)]
-ctypes.windll.user32.GetWindowPlacement.restype = wintypes.BOOL
-ctypes.windll.user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
-ctypes.windll.user32.GetAncestor.restype = wintypes.HWND
-ctypes.windll.user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
-ctypes.windll.user32.GetWindowRect.restype = wintypes.BOOL
-ctypes.windll.user32.IsIconic.argtypes = [wintypes.HWND]
-ctypes.windll.user32.IsIconic.restype = wintypes.BOOL
-ctypes.windll.user32.SetWindowPos.argtypes = [
-    wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
-    ctypes.c_int, ctypes.c_int, wintypes.UINT,
-]
-ctypes.windll.user32.SetWindowPos.restype = wintypes.BOOL
-ctypes.windll.user32.RegisterDeviceNotificationW.argtypes = [
-    wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
-]
-ctypes.windll.user32.RegisterDeviceNotificationW.restype = wintypes.HANDLE
-ctypes.windll.user32.UnregisterDeviceNotification.argtypes = [wintypes.HANDLE]
-ctypes.windll.user32.UnregisterDeviceNotification.restype = wintypes.BOOL
+    ctypes.windll.user32.GetWindowPlacement.argtypes = [wintypes.HWND, ctypes.POINTER(WINDOWPLACEMENT)]
+    ctypes.windll.user32.GetWindowPlacement.restype = wintypes.BOOL
+    ctypes.windll.user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    ctypes.windll.user32.GetAncestor.restype = wintypes.HWND
+    ctypes.windll.user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    ctypes.windll.user32.GetWindowRect.restype = wintypes.BOOL
+    ctypes.windll.user32.IsIconic.argtypes = [wintypes.HWND]
+    ctypes.windll.user32.IsIconic.restype = wintypes.BOOL
+    ctypes.windll.user32.SetWindowPos.argtypes = [
+        wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, wintypes.UINT,
+    ]
+    ctypes.windll.user32.SetWindowPos.restype = wintypes.BOOL
+    ctypes.windll.user32.RegisterDeviceNotificationW.argtypes = [
+        wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+    ]
+    ctypes.windll.user32.RegisterDeviceNotificationW.restype = wintypes.HANDLE
+    ctypes.windll.user32.UnregisterDeviceNotification.argtypes = [wintypes.HANDLE]
+    ctypes.windll.user32.UnregisterDeviceNotification.restype = wintypes.BOOL
 
-ctypes.windll.kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-ctypes.windll.kernel32.CloseHandle.restype = wintypes.BOOL
+    ctypes.windll.kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    ctypes.windll.kernel32.CloseHandle.restype = wintypes.BOOL
 
-ctypes.windll.kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-ctypes.windll.kernel32.OpenProcess.restype = wintypes.HANDLE
+    ctypes.windll.kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    ctypes.windll.kernel32.OpenProcess.restype = wintypes.HANDLE
 
-ctypes.windll.kernel32.QueryFullProcessImageNameW.argtypes = [
-    wintypes.HANDLE,
-    wintypes.DWORD,
-    wintypes.LPWSTR,
-    ctypes.POINTER(wintypes.DWORD),
-]
-ctypes.windll.kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    ctypes.windll.kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    ctypes.windll.kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
 
-ctypes.windll.user32.GetForegroundWindow.argtypes = []
-ctypes.windll.user32.GetForegroundWindow.restype = wintypes.HWND
+    ctypes.windll.user32.GetForegroundWindow.argtypes = []
+    ctypes.windll.user32.GetForegroundWindow.restype = wintypes.HWND
 
 from gui_widgets import (
     normalize_app_path,
@@ -431,21 +468,24 @@ def _effective_screen_height(width, height):
     return 1440
 
 
-try:
-    # Break out of Windows terminal DPI virtualization cache to get TRUE physical resolution
-    ctypes.windll.shcore.SetProcessDpiAwareness(2) # PROCESS_PER_MONITOR_DPI_AWARE
-except Exception:
+if sys.platform == "win32":
     try:
-        ctypes.windll.user32.SetProcessDPIAware()
+        # Break out of Windows terminal DPI virtualization cache to get TRUE physical resolution
+        ctypes.windll.shcore.SetProcessDpiAwareness(2) # PROCESS_PER_MONITOR_DPI_AWARE
     except Exception:
-        pass
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
 
-try:
-    screen_height = _effective_screen_height(
-        ctypes.windll.user32.GetSystemMetrics(0),  # SM_CXSCREEN
-        ctypes.windll.user32.GetSystemMetrics(1),  # SM_CYSCREEN
-    )
-except Exception:
+    try:
+        screen_height = _effective_screen_height(
+            ctypes.windll.user32.GetSystemMetrics(0),  # SM_CXSCREEN
+            ctypes.windll.user32.GetSystemMetrics(1),  # SM_CYSCREEN
+        )
+    except Exception:
+        screen_height = 1440
+else:
     screen_height = 1440
 
 # Baseline is 1440p physical height.
@@ -487,6 +527,8 @@ def _monitor_content_ratio(current_screen_height, user_scale=1.0):
     return (height / 1440.0) * scale
 
 def _get_window_non_client_height():
+    if sys.platform != "win32":
+        return 30
     caption_height = ctypes.windll.user32.GetSystemMetrics(4)   # SM_CYCAPTION
     frame_height = ctypes.windll.user32.GetSystemMetrics(33)    # SM_CYFRAME
     padded_border = ctypes.windll.user32.GetSystemMetrics(92)   # SM_CXPADDEDBORDER
@@ -503,7 +545,7 @@ class _MONITORINFO(ctypes.Structure):
 
 def _monitor_metrics(monitor):
     """Return physical monitor/work-area metrics for an HMONITOR."""
-    if not monitor:
+    if not monitor or sys.platform != "win32":
         return None
     try:
         get_monitor_info = ctypes.windll.user32.GetMonitorInfoW
@@ -537,6 +579,8 @@ def _monitor_metrics(monitor):
 
 def _monitor_metrics_from_point(x, y):
     """Return the nearest display for a physical screen coordinate."""
+    if sys.platform != "win32":
+        return None
     try:
         user32 = ctypes.windll.user32
         user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
@@ -550,6 +594,8 @@ def _monitor_metrics_from_point(x, y):
 
 def _monitor_metrics_from_window(hwnd):
     """Return the display containing most of a top-level window."""
+    if sys.platform != "win32":
+        return None
     try:
         user32 = ctypes.windll.user32
         user32.MonitorFromWindow.argtypes = [ctypes.c_void_p, wintypes.DWORD]
@@ -573,6 +619,11 @@ def _monitor_work_signature(monitor):
 
 def _top_level_hwnd(widget):
     """Return Tk's actual outer/root HWND, including title bar and borders."""
+    if sys.platform != "win32":
+        try:
+            return int(widget.winfo_id())
+        except Exception:
+            return None
     try:
         raw_hwnd = int(widget.winfo_id())
         user32 = ctypes.windll.user32
@@ -587,6 +638,8 @@ def _top_level_hwnd(widget):
 
 def _get_window_dpi(hwnd):
     """Return a top-level window's live DPI without affecting UI scaling."""
+    if sys.platform != "win32":
+        return None
     try:
         get_dpi = getattr(ctypes.windll.user32, "GetDpiForWindow", None)
         if get_dpi and hwnd:
@@ -639,7 +692,7 @@ def _fit_window_to_work_area(monitor, desired_client_width,
     non_client_width = 0
     non_client_height = 0
     try:
-        if hwnd:
+        if hwnd and sys.platform == "win32":
             outer = win32gui.GetWindowRect(int(hwnd))
             client = win32gui.GetClientRect(int(hwnd))
             non_client_width = max(
@@ -689,6 +742,8 @@ def _fit_window_to_work_area(monitor, desired_client_width,
 
 
 def _get_current_dpi_scale():
+    if sys.platform != "win32":
+        return 96, 1.0
     try:
         get_dpi = getattr(ctypes.windll.user32, "GetDpiForSystem", None)
         if get_dpi:
@@ -863,11 +918,12 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
         self.settings_frame = None
         self.no_controllers = True
         self.message_queue = queue.Queue()
+        self._ui_action_queue = queue.Queue()
         self.quit_event = threading.Event()
         self.discoverer_callback = None
         self.power_listener = PowerListener(
             self.handle_power_event,
-            show_window_callback=lambda: self.root and self.root.after(0, self.restore_and_bring_to_front)
+            show_window_callback=lambda: self.enqueue_ui_action(self.restore_and_bring_to_front)
         )
         self.last_width = CONFIG.window_width
         self.last_height = CONFIG.window_height
@@ -1090,7 +1146,7 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
 
     def start_joystick_calibration_from_callback(self, virtual_controller):
         if threading.current_thread() != threading.main_thread():
-            self.root.after(0, self.start_joystick_calibration_from_callback, virtual_controller)
+            self.enqueue_ui_action(self.start_joystick_calibration_from_callback, virtual_controller)
             return
         if virtual_controller is None or not getattr(virtual_controller, "controllers", None):
             utils.show_notification("Joysticks Calibration", "No joystick found for this player slot.")
@@ -1114,7 +1170,7 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
 
     def cancel_joystick_calibration_from_callback(self, virtual_controller):
         if threading.current_thread() != threading.main_thread():
-            self.root.after(0, self.cancel_joystick_calibration_from_callback, virtual_controller)
+            self.enqueue_ui_action(self.cancel_joystick_calibration_from_callback, virtual_controller)
             return
         key = id(virtual_controller) if virtual_controller is not None else None
         wizard = self.active_joystick_calibration_wizards.get(key)
@@ -1128,7 +1184,7 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
 
     def cancel_all_calibration_after_profile_switch(self):
         if threading.current_thread() != threading.main_thread():
-            self.root.after(0, self.cancel_all_calibration_after_profile_switch)
+            self.enqueue_ui_action(self.cancel_all_calibration_after_profile_switch)
             return
         calibration_active = False
         for wizard in list(getattr(self, "active_joystick_calibration_wizards", {}).values()):
@@ -1378,7 +1434,7 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
                     self.root.after(100, _hotplug_restart)
 
             try:
-                self.root.after(0, apply_status)
+                self.enqueue_ui_action(apply_status)
             except RuntimeError:
                 self._esp32s3_refresh_running = False
 
@@ -2574,16 +2630,17 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
 
     def init_interface(self):
         # 1. Enable Windows High DPI Mode
-        try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(2)
-        except:
+        if sys.platform == "win32":
             try:
-                ctypes.windll.user32.SetProcessDPIAware()
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)
             except:
-                pass
+                try:
+                    ctypes.windll.user32.SetProcessDPIAware()
+                except:
+                    pass
 
-        try: ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('Switch 2 Pro Connect')
-        except: pass
+            try: ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('Switch 2 Pro Connect')
+            except: pass
         self.root = tk.Tk()
         self.root.tk.call('tk', 'scaling', 1.3333333333333333)
         self.root.withdraw() # Hide while building the UI, then show from start().
@@ -2657,21 +2714,25 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
         # Set title bar color to match background
         try:
             self.root.update()
-            hwnd = _top_level_hwnd(self.root)
-            if not hwnd:
-                raise RuntimeError("Could not resolve Tk top-level HWND")
-            self.top_hwnd = hwnd
-            logger.info(
-                "Tk HWND resolved: widget=%s top_level=%s rect=%s state=%s",
-                self.root.winfo_id(), hwnd, win32gui.GetWindowRect(hwnd),
-                self.root.state())
-            color = background_color.lstrip('#')
-            r, g, b = int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16)
-            color_int = (b << 16) | (g << 8) | r # BGR format
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(ctypes.c_int(color_int)), 4) # Caption color
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 36, ctypes.byref(ctypes.c_int(0xFFFFFF)), 4)  # Title text color (White)
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(ctypes.c_int(1)), 4)         # Immersive dark mode
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(ctypes.c_int(2)), 4)         # Rounded corners
+            if sys.platform == "win32":
+                hwnd = _top_level_hwnd(self.root)
+                if not hwnd:
+                    raise RuntimeError("Could not resolve Tk top-level HWND")
+                self.top_hwnd = hwnd
+                logger.info(
+                    "Tk HWND resolved: widget=%s top_level=%s rect=%s state=%s",
+                    self.root.winfo_id(), hwnd, win32gui.GetWindowRect(hwnd),
+                    self.root.state())
+                color = background_color.lstrip('#')
+                r, g, b = int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16)
+                color_int = (b << 16) | (g << 8) | r # BGR format
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(ctypes.c_int(color_int)), 4) # Caption color
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 36, ctypes.byref(ctypes.c_int(0xFFFFFF)), 4)  # Title text color (White)
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(ctypes.c_int(1)), 4)         # Immersive dark mode
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(ctypes.c_int(2)), 4)         # Rounded corners
+            else:
+                self.top_hwnd = self.root.winfo_id()
+                hwnd = self.top_hwnd
             
             # Force the geometry, minsize, and scaling factor back to defaults to overwrite any initial scaling applied during update()
             self.root.tk.call('tk', 'scaling', 1.3333333333333333)
@@ -3127,13 +3188,18 @@ class ControllerWindow(ControllerWindowDriversMixin, ControllerWindowSettingsMix
 
             # Check if OS active window is our app
             try:
-                import win32process
-                import os
-                import ctypes
-                hwnd = ctypes.windll.user32.GetForegroundWindow()
-                _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                if pid != os.getpid():
-                    return
+                if sys.platform == "win32":
+                    import win32process
+                    import os
+                    import ctypes
+                    hwnd = ctypes.windll.user32.GetForegroundWindow()
+                    _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                    if pid != os.getpid():
+                        return
+                else:
+                    import linux_window
+                    if not linux_window.is_app_foreground(self.root):
+                        return
             except:
                 pass
 
@@ -5339,14 +5405,15 @@ bg_color=panel_bg, widths=[8, 10])
                         val = getattr(win32con, name)
                         if val not in vk_map:
                             vk_map[val] = name[3:]
-                for vk in range(8, 255):
-                    if ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000:
-                        if vk in vk_map:
-                            if f"VK_{vk_map[vk]}" not in recorded_seq:
-                                recorded_seq.append(f"VK_{vk_map[vk]}")
-                        elif (65 <= vk <= 90) or (48 <= vk <= 57):
-                            if f"VK_{chr(vk)}" not in recorded_seq:
-                                recorded_seq.append(f"VK_{chr(vk)}")
+                if sys.platform == "win32":
+                    for vk in range(8, 255):
+                        if ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000:
+                            if vk in vk_map:
+                                if f"VK_{vk_map[vk]}" not in recorded_seq:
+                                    recorded_seq.append(f"VK_{vk_map[vk]}")
+                            elif (65 <= vk <= 90) or (48 <= vk <= 57):
+                                if f"VK_{chr(vk)}" not in recorded_seq:
+                                    recorded_seq.append(f"VK_{chr(vk)}")
                 end_recording()
         recording_bind_ids["<FocusOut>"] = self.root.bind("<FocusOut>", on_focus_out, add="+")
         
@@ -7932,7 +7999,7 @@ bg_color=panel_bg, widths=[8, 10])
                         return
                 except:
                     pass
-                if not self.recorded_controller_buttons:
+                if not self.recorded_controller_buttons and sys.platform == "win32":
                     for vk in range(8, 255):
                         try:
                             if ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000:
@@ -8011,6 +8078,21 @@ bg_color=panel_bg, widths=[8, 10])
     def get_running_non_blocked_processes(self):
         """Scans interactive desktop applications (Apps section like Task Manager / Task View)
         filtering out background services, invisible processes, and AUTOBLOCK entries."""
+        if sys.platform != "win32":
+            try:
+                import linux_window
+                known_saved = set(CONFIG.get_known_games().keys())
+                my_pid = os.getpid()
+                last_exe = getattr(self, "last_external_app_exe", None)
+                return linux_window.get_running_desktop_apps(
+                    known_saved=known_saved,
+                    my_pid=my_pid,
+                    last_external_app_exe=last_exe
+                )
+            except Exception as e:
+                logger.debug(f"Linux process enumeration failed: {e}")
+                return []
+
         from config import AUTOBLOCK_NON_GAMING_PROCESSES, is_blocked_process
         import ctypes
         from ctypes import wintypes
@@ -10460,6 +10542,13 @@ bg_color=panel_bg, widths=[8, 10])
             self.app_profile_poll_suspended = False
 
     def get_foreground_app_path(self):
+        if sys.platform != "win32":
+            try:
+                import linux_window
+                return linux_window.get_active_window_process_path()
+            except Exception as e:
+                logger.debug(f"Failed to read foreground app path on Linux: {e}")
+                return ""
         try:
             import win32process
             hwnd = ctypes.windll.user32.GetForegroundWindow()
@@ -10490,6 +10579,13 @@ bg_color=panel_bg, widths=[8, 10])
         """Checks if a game executable process is actively running on the system."""
         if not exe_name:
             return False
+        if sys.platform != "win32":
+            try:
+                import linux_window
+                return linux_window.is_process_running(exe_name)
+            except Exception as e:
+                logger.debug(f"is_game_process_running failed on Linux: {e}")
+                return False
         exe_lower = exe_name.lower().strip()
 
         # 1. Check cached PID first (ultra-fast check)
@@ -10710,7 +10806,7 @@ bg_color=panel_bg, widths=[8, 10])
 
         # Execute on main thread to avoid Tkinter threading errors
         if threading.current_thread() != threading.main_thread():
-            self.root.after(0, self.on_cycle_profile)
+            self.enqueue_ui_action(self.on_cycle_profile)
             return
 
         sorted_profiles = self._change_list_profiles()
@@ -10749,7 +10845,7 @@ bg_color=panel_bg, widths=[8, 10])
 
     def on_profile_nav(self, direction):
         if threading.current_thread() != threading.main_thread():
-            self.root.after(0, self.on_profile_nav, direction)
+            self.enqueue_ui_action(self.on_profile_nav, direction)
             return
         import utils
         if not utils.profile_selection_active:
@@ -10770,7 +10866,7 @@ bg_color=panel_bg, widths=[8, 10])
 
     def on_profile_confirm(self):
         if threading.current_thread() != threading.main_thread():
-            self.root.after(0, self.on_profile_confirm)
+            self.enqueue_ui_action(self.on_profile_confirm)
             return
         import utils
         if not utils.profile_selection_active:
@@ -10784,7 +10880,7 @@ bg_color=panel_bg, widths=[8, 10])
 
     def on_profile_cancel(self):
         if threading.current_thread() != threading.main_thread():
-            self.root.after(0, self.on_profile_cancel)
+            self.enqueue_ui_action(self.on_profile_cancel)
             return
         import utils
         utils.profile_selection_active = False
@@ -10793,7 +10889,7 @@ bg_color=panel_bg, widths=[8, 10])
 
     def on_profile_combo_switch(self, profile_name):
         if threading.current_thread() != threading.main_thread():
-            self.root.after(0, lambda p=profile_name: self.on_profile_combo_switch(p))
+            self.enqueue_ui_action(self.on_profile_combo_switch, profile_name)
             return
         if profile_name not in CONFIG.profiles:
             return
@@ -11250,6 +11346,8 @@ bg_color=panel_bg, widths=[8, 10])
         self._slide_animation_id = self.root.after(16, lambda: _step(1))
 
     def _is_close_from_titlebar_x(self) -> bool:
+        if sys.platform != "win32":
+            return True
         try:
             raw_hwnd = self.root.winfo_id()
             top_hwnd = ctypes.windll.user32.GetAncestor(raw_hwnd, 2)
@@ -11349,6 +11447,37 @@ bg_color=panel_bg, widths=[8, 10])
             self.setup_tray()
 
     def restore_and_bring_to_front(self):
+        if sys.platform != "win32":
+            try:
+                import linux_window
+                p_val = linux_window.get_active_window_process_path()
+                if p_val:
+                    p_exe = os.path.basename(p_val).lower().strip()
+                    from config import is_blocked_process
+                    if not (is_blocked_process(p_exe) or p_exe.startswith("switch2proconnect") or p_exe.startswith("switch2connect") or "wabbajack" in p_exe):
+                        self.last_external_app_path = p_val
+                        self.last_external_app_exe = p_exe
+            except Exception:
+                pass
+
+            try:
+                root = self.root
+                if not root or not root.winfo_exists():
+                    return
+                root.deiconify()
+                root.state('normal')
+                self._relayout_after_restore()
+                root.lift()
+                root.attributes("-topmost", True)
+                root.focus_force()
+                root.update_idletasks()
+                root.update()
+                root.after(800, lambda: root.attributes("-topmost", False) if (root and root.winfo_exists()) else None)
+            except Exception as e:
+                logger.error(f"restore_and_bring_to_front failed on Linux: {e}")
+            return
+
+        t0 = time.perf_counter()
         try:
             prev_hwnd = ctypes.windll.user32.GetForegroundWindow()
             if prev_hwnd:
@@ -11362,6 +11491,7 @@ bg_color=panel_bg, widths=[8, 10])
                         if ctypes.windll.kernel32.QueryFullProcessImageNameW(h_proc, 0, p_buf, ctypes.byref(sz)):
                             if p_buf.value:
                                 p_val = p_buf.value
+                                p_exe = os.path.basename(p_val).lower().strip()
                                 from config import is_blocked_process
                                 if not (is_blocked_process(p_exe) or p_exe.startswith("switch2proconnect") or p_exe.startswith("switch2connect") or "wabbajack" in p_exe):
                                     self.last_external_app_path = p_val
@@ -11375,119 +11505,58 @@ bg_color=panel_bg, widths=[8, 10])
             if not root or not root.winfo_exists():
                 return
 
-            try:
-                root.deiconify()
-                root.state('normal')
-                root.update_idletasks()
-            except Exception as _deiconify_err:
-                logger.debug(f"deiconify error: {_deiconify_err}")
-
             top_hwnd = getattr(self, "top_hwnd", None) or _top_level_hwnd(root)
             if not top_hwnd:
                 top_hwnd = root.winfo_id()
 
             user32 = ctypes.windll.user32
-            kernel32 = ctypes.windll.kernel32
-
-            # Win32 SW_RESTORE to un-minimize native window:
-            user32.ShowWindow(top_hwnd, 9)  # SW_RESTORE
 
             try:
                 root.deiconify()
                 root.state('normal')
-                self._relayout_after_restore()
-                root.update_idletasks()
-                root.update()
             except Exception as _deiconify_err:
                 logger.debug(f"deiconify error: {_deiconify_err}")
 
-            fore_hwnd = user32.GetForegroundWindow()
-            fore_thread = user32.GetWindowThreadProcessId(fore_hwnd, None) if fore_hwnd else 0
-            cur_thread = kernel32.GetCurrentThreadId()
-            gui_thread = user32.GetWindowThreadProcessId(top_hwnd, None) or cur_thread
+            if top_hwnd:
+                user32.ShowWindow(top_hwnd, 9)  # SW_RESTORE
+                user32.SetWindowPos(top_hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)
+                user32.SetForegroundWindow(top_hwnd)
+                user32.BringWindowToTop(top_hwnd)
 
-            try:
-                user32.LockSetForegroundWindow(2)   # LSFW_UNLOCK
-                user32.AllowSetForegroundWindow(-1) # ASFW_ANY
-            except Exception:
-                pass
-
-            attached = False
-            if fore_thread and fore_thread != gui_thread:
-                attached = bool(user32.AttachThreadInput(gui_thread, fore_thread, True))
-
-            def _is_fullscreen_game(hwnd):
-                if not hwnd: return False
-                try:
-                    cls_buf = ctypes.create_unicode_buffer(256)
-                    user32.GetClassNameW(hwnd, cls_buf, 256)
-                    cls_name = cls_buf.value
-                    if cls_name in ("Shell_TrayWnd", "Progman", "WorkerW", "Windows.UI.Core.CoreWindow", "NotifyIconOverflowWindow"):
-                        return False
-                    rect = ctypes.wintypes.RECT()
-                    if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-                        sw = user32.GetSystemMetrics(0)
-                        sh = user32.GetSystemMetrics(1)
-                        if rect.left <= 0 and rect.top <= 0 and (rect.right - rect.left) >= sw and (rect.bottom - rect.top) >= sh:
-                            return True
-                except Exception:
-                    pass
-                return False
-
-            if fore_hwnd and fore_hwnd != top_hwnd and _is_fullscreen_game(fore_hwnd):
-                user32.ShowWindow(fore_hwnd, 6)   # SW_MINIMIZE (drops exclusive fullscreen game)
-
-            # VK_MENU (Alt key) pulse grants foreground lock permission under Windows restrictions
-            user32.keybd_event(0x12, 0, 0, 0)
-            user32.keybd_event(0x12, 0, 2, 0)
-
-            user32.SetWindowPos(top_hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)  # HWND_TOPMOST, SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW
-            user32.SetForegroundWindow(top_hwnd)
-            user32.BringWindowToTop(top_hwnd)
-
-            try:
-                user32.SwitchToThisWindow(top_hwnd, True)
-            except Exception:
-                pass
-
-            if attached:
-                user32.AttachThreadInput(gui_thread, fore_thread, False)
-
+            self._relayout_after_restore()
             root.lift()
             root.attributes("-topmost", True)
             root.focus_force()
+            root.update_idletasks()
 
-            # Force immediate Windows and Tkinter repainting so all widgets display fully without requiring a mouse click:
-            try:
-                user32.RedrawWindow(top_hwnd, None, None, 0x0001 | 0x0002 | 0x0004 | 0x0080 | 0x0100)
-                raw_id = root.winfo_id()
-                if raw_id and raw_id != top_hwnd:
-                    user32.RedrawWindow(raw_id, None, None, 0x0001 | 0x0002 | 0x0004 | 0x0080 | 0x0100)
-                self._relayout_after_restore()
-                root.update_idletasks()
-                root.update()
-            except Exception:
-                pass
-
-            # Temporarily stay topmost for 800ms to guarantee appearing above fullscreen/borderless games,
-            # then release topmost so user can interact normally with other apps
-            root.after(800, lambda: root.attributes("-topmost", False) if (root and root.winfo_exists()) else None)
+            root.after(250, lambda: root.attributes("-topmost", False) if (root and root.winfo_exists()) else None)
+            logger.info("Window restored to front in %.1f ms", (time.perf_counter() - t0) * 1000.0)
         except Exception as e:
             logger.error(f"restore_and_bring_to_front failed: {e}", exc_info=True)
+
+    def enqueue_ui_action(self, func, *args, **kwargs):
+        if getattr(self, "is_quitting", False):
+            return
+        if threading.current_thread() is threading.main_thread() and self.root is not None:
+            try:
+                self.root.after(0, lambda: func(*args, **kwargs))
+            except Exception:
+                pass
+        else:
+            self._ui_action_queue.put_nowait((func, args, kwargs))
 
     def show_window(self, icon=None, item=None):
         logger.info("Open/Restore requested (tray icon or C button).")
         def _restore_to_main():
             self.close_all_sub_windows()
             self.restore_and_bring_to_front()
-        if self.root:
-            self.root.after(0, _restore_to_main)
+        self.enqueue_ui_action(_restore_to_main)
 
     def hard_exit(self, icon=None, item=None):
         logger.info("Hard exit requested from tray icon.")
         try:
             if self.root:
-                self.root.after(0, self.on_quit)
+                self.enqueue_ui_action(self.on_quit)
             else:
                 self.on_quit()
         except Exception:
@@ -11808,7 +11877,7 @@ bg_color=panel_bg, widths=[8, 10])
                     self._wired_pro2_prompt_shown = False
 
             try:
-                self.root.after(0, apply)
+                self.enqueue_ui_action(apply)
             except Exception:
                 self._wired_pro2_refresh_running = False
 
@@ -11826,8 +11895,8 @@ bg_color=panel_bg, widths=[8, 10])
                 try:
                     self.check_driver_installation(save=True, prompt_user=False)
                     keyboard_output.initialize()
-                    self.root.after(0, self.refresh_profile_switching_combo_trigger_ui)
-                    self.root.after(0, self.update_driver_button)
+                    self.enqueue_ui_action(self.refresh_profile_switching_combo_trigger_ui)
+                    self.enqueue_ui_action(self.update_driver_button)
                 except Exception as e:
                     logger.debug(f"Startup driver check failed: {e}")
 
@@ -11872,23 +11941,66 @@ bg_color=panel_bg, widths=[8, 10])
                 start_driver_check_and_discovery(bridge_context)
 
             try:
-                self.root.after(0, apply_status)
+                self.enqueue_ui_action(apply_status)
             except RuntimeError:
                 pass
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def poll_controller_updates(self):
+        if getattr(self, 'is_quitting', False):
+            return
+        has_update = False
+        latest_vcs = None
+        try:
+            while True:
+                try:
+                    latest_vcs = self.message_queue.get_nowait()
+                    has_update = True
+                except queue.Empty:
+                    break
+        except Exception:
+            pass
+
+        if has_update:
+            try:
+                t_ui = time.perf_counter()
+                self.update(latest_vcs)
+                if self.root is not None:
+                    self.root.update_idletasks()
+                logger.info("Controller UI updated in %.1f ms", (time.perf_counter() - t_ui) * 1000.0)
+            except Exception as e:
+                logger.error(f"Controller UI update failed: {e}", exc_info=True)
+
+        try:
+            while True:
+                try:
+                    func, args, kwargs = self._ui_action_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    func(*args, **kwargs)
+                except Exception as e:
+                    logger.error(f"Queued UI action failed: {e}", exc_info=True)
+        except Exception:
+            pass
+
+        if not getattr(self, 'is_quitting', False) and self.root is not None:
+            try:
+                self.root.after(20, self.poll_controller_updates)
+            except Exception:
+                pass
 
     def start(self):
         self.is_quitting = False
         def callback(vcs):
             if not getattr(self, 'is_quitting', False):
                 try:
-                    self.message_queue.put(vcs)
-                    self.root.event_generate(CONTROLLER_UPDATED_EVENT)
+                    self.message_queue.put_nowait(vcs)
                 except Exception as e:
-                    logger.debug(f"Ignored Tkinter event generation error: {e}")
+                    logger.debug(f"Ignored controller update queue error: {e}")
         self.discoverer_callback = callback
-        self.root.bind(CONTROLLER_UPDATED_EVENT, lambda e: self.update(self.message_queue.get()))
+        self.root.after(25, self.poll_controller_updates)
         
         self.power_listener.start()
         try:

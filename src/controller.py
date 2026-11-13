@@ -23,8 +23,21 @@ from bleak.backends.device import BLEDevice
 import asyncio
 BLE_CONNECTION_LOCK = asyncio.Lock()
 import logging
-import win32api
-import win32con
+import sys
+import os
+
+if sys.platform == "win32":
+    import win32api
+    import win32con
+else:
+    try:
+        import linux_uinput
+        linux_uinput.install_win32_shims()
+    except Exception:
+        pass
+    import win32api
+    import win32con
+
 from dataclasses import dataclass
 import ctypes
 import time
@@ -143,35 +156,21 @@ def bring_switch2connect_to_front():
             if hasattr(__main__, "ControllerWindow"):
                 instance = getattr(__main__.ControllerWindow, "_current_instance", None)
             elif hasattr(__main__, "win"):
-                instance = getattr(__main__.win, None)
+                instance = getattr(__main__, "win", None)
         if not instance:
-            import sys
             instance = getattr(sys, "_switch2proconnect_gui_instance", None) or getattr(sys, "_switch2connect_gui_instance", None)
         
         if instance and getattr(instance, "root", None):
-            try:
-                user32 = ctypes.windll.user32
-                fore_hwnd = user32.GetForegroundWindow()
-                raw_hwnd = instance.root.winfo_id()
-                top_hwnd = user32.GetAncestor(raw_hwnd, 2) or raw_hwnd
-                if fore_hwnd and fore_hwnd != top_hwnd:
-                    user32.ShowWindow(fore_hwnd, 6)   # SW_MINIMIZE (drops exclusive fullscreen)
-                    user32.ShowWindow(fore_hwnd, 11)  # SW_FORCEMINIMIZE
-                user32.keybd_event(0x12, 0, 0, 0)
-                user32.keybd_event(0x12, 0, 2, 0)
-                user32.ShowWindow(top_hwnd, 9)        # SW_RESTORE
-                user32.SetWindowPos(top_hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)  # HWND_TOPMOST, SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW
-                user32.SetForegroundWindow(top_hwnd)
-                user32.BringWindowToTop(top_hwnd)
-            except Exception:
-                pass
             def _restore():
                 try:
                     instance.close_all_sub_windows()
                     instance.restore_and_bring_to_front()
                 except Exception as ex:
                     logger.error(f"Error in restore_and_bring_to_front: {ex}", exc_info=True)
-            instance.root.after(0, _restore)
+            if hasattr(instance, "enqueue_ui_action"):
+                instance.enqueue_ui_action(_restore)
+            else:
+                instance.root.after(0, _restore)
     except Exception as e:
         logger.error(f"bring_switch2connect_to_front error: {e}", exc_info=True)
 
@@ -1874,8 +1873,9 @@ class Controller:
                 kwargs = {"disconnected_callback": disconnected_callback}
                 if services is not None:
                     kwargs["services"] = services
-                if cached_services:
+                if cached_services and sys.platform == "win32":
                     kwargs["winrt"] = {"use_cached_services": True}
+
                 try:
                     return BleakClient(self.device, **kwargs), cached_services
                 except TypeError:
@@ -1901,7 +1901,8 @@ class Controller:
 
             async def connect_variant(services, cached_services=False):
                 self.client, cache_applied = make_client(services, cached_services)
-                await self.client.connect(timeout=20.0)
+                connect_timeout = 3.0 if cache_applied else 20.0
+                await self.client.connect(timeout=connect_timeout)
                 return cache_applied
 
             requested_services = [SW2_SERVICE_UUID] if use_service_filter else None
@@ -1972,7 +1973,6 @@ class Controller:
                     pass
             raise e
 
-        import sys
         if sys.platform == "win32":
             preferred_supported, preferred_reason = (
                 preferred_connection_parameters_supported())

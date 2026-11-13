@@ -1,11 +1,24 @@
+import sys
+import os
 import ctypes
-from ctypes import wintypes
 import logging
 import threading
 import time
 import uuid
-import win32con
-import win32gui
+
+from ctypes import wintypes
+
+if sys.platform == "win32":
+    import win32con
+    import win32gui
+else:
+    try:
+        import linux_uinput
+        linux_uinput.install_win32_shims()
+    except Exception:
+        pass
+    import win32con
+    import win32gui
 
 try:
     from usb_hid_controller import WIRED_USB_PIDS as WIRED_USB_DEVICE_PIDS
@@ -13,6 +26,7 @@ except Exception:
     WIRED_USB_DEVICE_PIDS = (0x2069, 0x2073)
 
 logger = logging.getLogger(__name__)
+
 
 class SHELLEXECUTEINFOW(ctypes.Structure):
     _fields_ = [
@@ -78,37 +92,39 @@ class DEV_BROADCAST_DEVICEINTERFACE_W(ctypes.Structure):
 
 
 # Explicitly set types for Win32 API to ensure compatibility
-ctypes.windll.shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
-ctypes.windll.shell32.ShellExecuteExW.restype = wintypes.BOOL
+if sys.platform == "win32":
+    ctypes.windll.shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
+    ctypes.windll.shell32.ShellExecuteExW.restype = wintypes.BOOL
 
-ctypes.windll.kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-ctypes.windll.kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    ctypes.windll.kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    ctypes.windll.kernel32.WaitForSingleObject.restype = wintypes.DWORD
 
-ctypes.windll.kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-ctypes.windll.kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    ctypes.windll.kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    ctypes.windll.kernel32.GetExitCodeProcess.restype = wintypes.BOOL
 
-ctypes.windll.user32.GetWindowPlacement.argtypes = [wintypes.HWND, ctypes.POINTER(WINDOWPLACEMENT)]
-ctypes.windll.user32.GetWindowPlacement.restype = wintypes.BOOL
-ctypes.windll.user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
-ctypes.windll.user32.GetAncestor.restype = wintypes.HWND
-ctypes.windll.user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
-ctypes.windll.user32.GetWindowRect.restype = wintypes.BOOL
-ctypes.windll.user32.IsIconic.argtypes = [wintypes.HWND]
-ctypes.windll.user32.IsIconic.restype = wintypes.BOOL
-ctypes.windll.user32.SetWindowPos.argtypes = [
-    wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
-    ctypes.c_int, ctypes.c_int, wintypes.UINT,
-]
-ctypes.windll.user32.SetWindowPos.restype = wintypes.BOOL
-ctypes.windll.user32.RegisterDeviceNotificationW.argtypes = [
-    wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
-]
-ctypes.windll.user32.RegisterDeviceNotificationW.restype = wintypes.HANDLE
-ctypes.windll.user32.UnregisterDeviceNotification.argtypes = [wintypes.HANDLE]
-ctypes.windll.user32.UnregisterDeviceNotification.restype = wintypes.BOOL
+    ctypes.windll.user32.GetWindowPlacement.argtypes = [wintypes.HWND, ctypes.POINTER(WINDOWPLACEMENT)]
+    ctypes.windll.user32.GetWindowPlacement.restype = wintypes.BOOL
+    ctypes.windll.user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    ctypes.windll.user32.GetAncestor.restype = wintypes.HWND
+    ctypes.windll.user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    ctypes.windll.user32.GetWindowRect.restype = wintypes.BOOL
+    ctypes.windll.user32.IsIconic.argtypes = [wintypes.HWND]
+    ctypes.windll.user32.IsIconic.restype = wintypes.BOOL
+    ctypes.windll.user32.SetWindowPos.argtypes = [
+        wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, wintypes.UINT,
+    ]
+    ctypes.windll.user32.SetWindowPos.restype = wintypes.BOOL
+    ctypes.windll.user32.RegisterDeviceNotificationW.argtypes = [
+        wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+    ]
+    ctypes.windll.user32.RegisterDeviceNotificationW.restype = wintypes.HANDLE
+    ctypes.windll.user32.UnregisterDeviceNotification.argtypes = [wintypes.HANDLE]
+    ctypes.windll.user32.UnregisterDeviceNotification.restype = wintypes.BOOL
 
-ctypes.windll.kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-ctypes.windll.kernel32.CloseHandle.restype = wintypes.BOOL
+    ctypes.windll.kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    ctypes.windll.kernel32.CloseHandle.restype = wintypes.BOOL
+
 
 SEE_MASK_NOCLOSEPROCESS = 0x00000040
 WAIT_TIMEOUT = 0x00000102
@@ -121,28 +137,67 @@ class PowerListener:
         self.callback = callback
         self.show_window_callback = show_window_callback
         self.hwnd = None
-        try:
-            self.wm_show_app = win32gui.RegisterWindowMessage("Switch2ProConnect_ShowWindow_Message")
-            self.wm_show_app_legacy = win32gui.RegisterWindowMessage("Switch2Connect_ShowWindow_Message")
-        except Exception:
+        self._running = False
+        if sys.platform == "win32":
+            try:
+                self.wm_show_app = win32gui.RegisterWindowMessage("Switch2ProConnect_ShowWindow_Message")
+                self.wm_show_app_legacy = win32gui.RegisterWindowMessage("Switch2Connect_ShowWindow_Message")
+            except Exception:
+                self.wm_show_app = 0
+                self.wm_show_app_legacy = 0
+        else:
             self.wm_show_app = 0
             self.wm_show_app_legacy = 0
+            import tempfile
+            uid = os.getuid() if hasattr(os, "getuid") else 1000
+            self._sock_path = os.path.join(tempfile.gettempdir(), f"switch2proconnect_{uid}.sock")
 
     def start(self):
-        def _listen():
-            wc = win32gui.WNDCLASS()
-            wc.lpfnWndProc = self.wndproc
-            wc.lpszClassName = "PowerListenerWindow"
-            hInstance = win32gui.GetModuleHandle(None)
-            wc.hInstance = hInstance
-            try:
-                class_atom = win32gui.RegisterClass(wc)
-                self.hwnd = win32gui.CreateWindow(class_atom, "PowerListener", 0, 0, 0, 0, 0, 0, 0, hInstance, None)
-                win32gui.PumpMessages()
-            except Exception as e:
-                logger.error(f"PowerListener failed: {e}")
-            
-        threading.Thread(target=_listen, daemon=True).start()
+        if sys.platform == "win32":
+            def _listen():
+                wc = win32gui.WNDCLASS()
+                wc.lpfnWndProc = self.wndproc
+                wc.lpszClassName = "PowerListenerWindow"
+                hInstance = win32gui.GetModuleHandle(None)
+                wc.hInstance = hInstance
+                try:
+                    class_atom = win32gui.RegisterClass(wc)
+                    self.hwnd = win32gui.CreateWindow(class_atom, "PowerListener", 0, 0, 0, 0, 0, 0, 0, hInstance, None)
+                    win32gui.PumpMessages()
+                except Exception as e:
+                    logger.error(f"PowerListener failed: {e}")
+                
+            threading.Thread(target=_listen, daemon=True).start()
+        else:
+            def _listen_linux():
+                import socket
+                try:
+                    if os.path.exists(self._sock_path):
+                        try:
+                            os.unlink(self._sock_path)
+                        except OSError:
+                            pass
+                    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    s.bind(self._sock_path)
+                    s.listen(2)
+                    s.settimeout(1.0)
+                    self._running = True
+                    while self._running:
+                        try:
+                            conn, _ = s.accept()
+                            data = conn.recv(1024)
+                            conn.close()
+                            if b"SHOW" in data and self.show_window_callback:
+                                self.show_window_callback()
+                        except socket.timeout:
+                            continue
+                        except Exception:
+                            break
+                    s.close()
+                except Exception as e:
+                    logger.debug("Linux IPC listener failed: %s", e)
+            threading.Thread(target=_listen_linux, daemon=True).start()
+
 
     def wndproc(self, hwnd, msg, wparam, lparam):
         if msg == win32con.WM_POWERBROADCAST:
@@ -187,21 +242,100 @@ class WiredDeviceChangeListener:
         if self.thread and self.thread.is_alive():
             return
         self._stop_event.clear()
-        self.thread = threading.Thread(target=self._listen, daemon=True)
+        if sys.platform == "win32":
+            self.thread = threading.Thread(target=self._listen, daemon=True)
+        else:
+            self.thread = threading.Thread(target=self._listen_linux, daemon=True)
         self.thread.start()
 
     def stop(self):
         self._stop_event.set()
-        hwnd = self.hwnd
-        if hwnd:
-            try:
-                win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
-            except Exception:
-                pass
+        if sys.platform == "win32":
+            hwnd = self.hwnd
+            if hwnd:
+                try:
+                    win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+                except Exception:
+                    pass
         if self.thread and self.thread.is_alive():
             self.thread.join(timeout=1.0)
         self.thread = None
         self.hwnd = None
+
+    def _listen_linux(self):
+        try:
+            import pyudev
+            context = pyudev.Context()
+            monitor = pyudev.Monitor.from_netlink(context)
+            monitor.filter_by(subsystem="hidraw")
+            monitor.filter_by(subsystem="bluetooth")
+            for device in iter(monitor.poll, None):
+                if self._stop_event.is_set():
+                    break
+                action = device.action
+                if action not in ("add", "remove"):
+                    continue
+                reason = "device_arrival" if action == "add" else "device_removal"
+                subsystem = device.subsystem
+                if subsystem == "bluetooth":
+                    self.event_queue.put_nowait({
+                        "kind": "bluetooth_radio",
+                        "reason": reason,
+                        "path": device.device_node or str(device),
+                        "timestamp": time.time(),
+                    })
+                elif subsystem == "hidraw":
+                    parent = device.find_parent("usb")
+                    if parent:
+                        id_vendor = parent.get("ID_VENDOR_ID") or ""
+                        id_model = parent.get("ID_MODEL_ID") or ""
+                        try:
+                            vid = int(id_vendor, 16)
+                            pid = int(id_model, 16)
+                            if vid == 0x057E and pid in WIRED_USB_DEVICE_PIDS:
+                                self.event_queue.put_nowait({
+                                    "kind": "wired",
+                                    "reason": reason,
+                                    "path": device.device_node,
+                                    "timestamp": time.time(),
+                                })
+                        except (ValueError, TypeError):
+                            pass
+        except ImportError:
+            logger.info("pyudev not installed; using polling for wired USB controller detection.")
+            self._poll_linux()
+        except Exception as e:
+            logger.error("Linux device change listener error: %s", e)
+
+    def _poll_linux(self):
+        known_nodes = set()
+        while not self._stop_event.is_set():
+            try:
+                if os.path.exists("/dev"):
+                    current_nodes = set(
+                        os.path.join("/dev", f) for f in os.listdir("/dev") if f.startswith("hidraw")
+                    )
+                    added = current_nodes - known_nodes
+                    removed = known_nodes - current_nodes
+                    for node in added:
+                        self.event_queue.put_nowait({
+                            "kind": "wired",
+                            "reason": "device_arrival",
+                            "path": node,
+                            "timestamp": time.time(),
+                        })
+                    for node in removed:
+                        self.event_queue.put_nowait({
+                            "kind": "wired",
+                            "reason": "device_removal",
+                            "path": node,
+                            "timestamp": time.time(),
+                        })
+                    known_nodes = current_nodes
+            except Exception:
+                pass
+            time.sleep(2.0)
+
 
     def _listen(self):
         wc = win32gui.WNDCLASS()

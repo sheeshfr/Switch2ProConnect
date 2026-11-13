@@ -18,8 +18,23 @@
 # Electronic Mail: tommyw9318@gmail.com
 
 import struct
-import winuhid_client as winuhid
-from vigem_commons import DS4_REPORT_EX, DS4_BUTTONS, DS4_DPAD_DIRECTIONS, DS4_SPECIAL_BUTTONS
+import sys
+
+if sys.platform == "win32":
+    import winuhid_client as winuhid
+    from vigem_commons import DS4_REPORT_EX, DS4_BUTTONS, DS4_DPAD_DIRECTIONS, DS4_SPECIAL_BUTTONS
+else:
+    try:
+        import linux_uinput
+        linux_uinput.install_win32_shims()
+    except Exception:
+        pass
+    winuhid = None
+    class DS4_REPORT_EX: pass
+    class DS4_BUTTONS: pass
+    class DS4_DPAD_DIRECTIONS: pass
+    class DS4_SPECIAL_BUTTONS: pass
+
 import threading
 import os
 import math
@@ -36,6 +51,8 @@ def get_vigem():
     with _vigem_import_lock:
         if _vigem_module is not None:
             return _vigem_module
+        if sys.platform != "win32":
+            return None
         import sys
         for mod in list(sys.modules.keys()):
             if mod == 'vgamepad' or mod.startswith('vgamepad.'):
@@ -43,6 +60,7 @@ def get_vigem():
         import vgamepad as vigem
         _vigem_module = vigem
         return _vigem_module
+
 import asyncio
 import threading
 import ctypes
@@ -575,12 +593,12 @@ class VirtualController:
         self.update_thread = threading.Thread(target=self._1000hz_loop, daemon=True)
         self.update_thread.start()
 
-    def _start_dualsense_audio_guard(self):
-        pass
-
-    def _stop_dualsense_audio_guard(self):
-        pass
-
+    def _start_dualsense_audio_guard(self):
+        pass
+
+    def _stop_dualsense_audio_guard(self):
+        pass
+
     def _on_ps5_usbip_disconnected(self):
         if getattr(self, 'mode', None) != "PS5" or getattr(self, 'driver_type', None) != "USBIP":
             return
@@ -1371,8 +1389,10 @@ class VirtualController:
             if self.vg_controller is None and self.running:
                 self._setup_vg_controller()
             ready = self._submit_virtual_ready_probe()
+            self._full_submit_signatures.clear()
         if not ready:
             raise RuntimeError("virtual device did not accept neutral readiness probe")
+        self._submit_wake.set()
 
     def _submit_virtual_ready_probe(self):
         """Submit the already-neutral report and use its native result as readiness.
@@ -1620,10 +1640,25 @@ class VirtualController:
             self.vg_controller = MockGamepad()
             self.driver_type = "USBIP"
         else:
-            if driver_type == "USBIP" and self.mode == "PS5":
-                logger.error("PS5 USBIP emulation has been removed in this mod. Please use Xbox One (WinUHid) or Xbox 360 (ViGEmBus).")
-                self.vg_controller = None
-                self.usbip_server = None
+            if sys.platform != "win32" or driver_type == "uinput":
+                try:
+                    from linux_uinput import UInputXboxGamepad, UInputDS4Gamepad, get_device_grabber
+                    if self.mode in ("PS4", "PS5"):
+                        self.vg_controller = UInputDS4Gamepad()
+                        self.report = self.vg_controller.report
+                        logger.info("Switched to virtual PS4 controller via Linux uinput")
+                    else:
+                        self.vg_controller = UInputXboxGamepad()
+                        logger.info("Switched to virtual Xbox 360 controller via Linux uinput")
+                    self.driver_type = "uinput"
+                    get_device_grabber().grab_matching_devices()
+                except Exception as e:
+                    logger.error(f"Linux uinput initialization failed: {e}")
+                    self.vg_controller = None
+            elif driver_type == "USBIP" and self.mode == "PS5":
+                logger.error("PS5 USBIP emulation has been removed in this mod. Please use Xbox One (WinUHid) or Xbox 360 (ViGEmBus).")
+                self.vg_controller = None
+                self.usbip_server = None
             elif driver_type == "ViGEmBus":
                 try:
                     vigem = get_vigem()

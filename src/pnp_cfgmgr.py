@@ -17,6 +17,7 @@
 # Callers must treat that as "unknown", never as "none found" - see the tri-state
 # handling in driver_install_helper.get_winuhid_status.
 
+import sys
 import ctypes
 from ctypes import wintypes
 
@@ -53,8 +54,11 @@ _load_failed = False
 def _lib():
     """Load cfgmgr32 once. Returns None when it is not usable."""
     global _library, _load_failed
+    if sys.platform != "win32":
+        return None
     if _library is not None or _load_failed:
         return _library
+
     try:
         candidate = ctypes.WinDLL("cfgmgr32")
         for name in _ENTRY_POINTS:

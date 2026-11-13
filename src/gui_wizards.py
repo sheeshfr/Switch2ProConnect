@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import math
+import sys
 import threading
 import time
 import tkinter as tk
@@ -55,9 +56,13 @@ class CalibrationOverlay:
 
     def update(self, title, message):
         # We must run this on the main thread. If we are called from a background thread,
-        # we schedule it via self.root.after
+        # we schedule it via enqueue_ui_action (or self.root.after as fallback).
         if threading.current_thread() != threading.main_thread():
-            self.root.after(0, self.update, title, message)
+            gui_inst = getattr(sys, "_switch2proconnect_gui_instance", None)
+            if gui_inst is not None and hasattr(gui_inst, "enqueue_ui_action"):
+                gui_inst.enqueue_ui_action(self.update, title, message)
+            else:
+                self.root.after(0, self.update, title, message)
             return
 
         # Suppress calibration completion, cancellation, and status bottom-right toasts

@@ -99,7 +99,7 @@ _PNPUTIL_LOCK = threading.Lock()
 
 # Status queries spawn two or three processes each and are called from UI refresh
 # paths; short-lived caching keeps those paths cheap without hiding real changes.
-_STATUS_TTL = 5.0
+_STATUS_TTL = 30.0
 _status_cache = {}
 _status_lock = threading.Lock()
 
@@ -399,6 +399,14 @@ def _enum_driver_packages(runner, inf_name, database_name, errors):
     nonzero exit code; the driver database answers the same question as a plain
     user. Returns None only when neither source could answer.
     """
+    if runner is _run_pnputil:
+        try:
+            fast = _driver_database_packages(database_name)
+            if fast is not None:
+                return fast
+        except Exception:
+            pass
+
     try:
         result = runner(["/enum-drivers"])
         code = getattr(result, "returncode", 0)

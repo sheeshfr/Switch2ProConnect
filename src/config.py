@@ -587,7 +587,7 @@ class MouseConfig:
 
 _PACKAGED_CACHE = None
 _PACKAGED_WINUHID_CACHE = None
-PRODUCTION_DEFAULT_DRIVER_TYPE = "WinUHid"
+PRODUCTION_DEFAULT_DRIVER_TYPE = "WinUHid" if sys.platform == "win32" else "uinput"
 def _packaged_build():
     """True when running from the MSIX/Store package (drivers differ there)."""
     global _PACKAGED_CACHE
@@ -1026,9 +1026,12 @@ class Config:
         # HidHide when connected. Disabling in the HidHide window sets this False so a later
         # replug is NOT re-hidden (third-party software can see the controller again).
         self.hidhide_hide_enabled = config.get("hidhide_hide_enabled", True)
-        self.driver_type = config.get("driver_type", "WinUHid")
-        if self.driver_type not in ["WinUHid", "ViGEmBus", "USBIP"]:
+        self.driver_type = config.get("driver_type", PRODUCTION_DEFAULT_DRIVER_TYPE)
+        if sys.platform != "win32":
+            self.driver_type = "uinput"
+        elif self.driver_type not in ["WinUHid", "ViGEmBus", "USBIP"]:
             self.driver_type = "WinUHid"
+
         if self._first_run_driver_default_pending:
             # A machine with no external config is a genuine first run. Do not
             # let machine-local state captured in a build seed become the new

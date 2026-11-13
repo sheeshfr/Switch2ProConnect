@@ -1541,6 +1541,10 @@ def _remember_verified_port(port_info):
         CONFIG.save_config()
 
 
+_NEGATIVE_PROBE_CACHE: set[tuple[str, str]] = set()
+_LAST_LOGGED_CANDIDATES_SIGNATURE: str | None = None
+
+
 def detect_bridge(preferred_port=None, allow_unverified=False):
     """Detect a running bridge, optionally exposing blank-board flash candidates.
 
@@ -1548,15 +1552,22 @@ def detect_bridge(preferred_port=None, allow_unverified=False):
     devices are only surfaced inside the user-initiated firmware UI and never
     become controller transports merely because they are the only COM port.
     """
+    global _LAST_LOGGED_CANDIDATES_SIGNATURE
     serials = scan_serial_ports()
-    logger.info(
-        "ESP32-S3 port candidates: %s",
-        ", ".join(
-            f"{item.port}[confidence={item.confidence}, otg={item.is_otg}, "
-            f"name={item.name or item.manufacturer or 'unknown'}]"
-            for item in serials
-        ) or "none",
-    )
+    candidates_summary = ", ".join(
+        f"{item.port}[confidence={item.confidence}, otg={item.is_otg}, "
+        f"name={item.name or item.manufacturer or 'unknown'}]"
+        for item in serials
+    ) or "none"
+    if candidates_summary != _LAST_LOGGED_CANDIDATES_SIGNATURE:
+        _LAST_LOGGED_CANDIDATES_SIGNATURE = candidates_summary
+        logger.info("ESP32-S3 port candidates: %s", candidates_summary)
+    else:
+        logger.debug("ESP32-S3 port candidates: %s", candidates_summary)
+
+    present_keys = {(item.port.upper(), (item.device_id or "").upper()) for item in serials}
+    _NEGATIVE_PROBE_CACHE.intersection_update(present_keys)
+
     configured, manual = _configured_port(serials, preferred_port)
     # Manual selection probes exactly one port.  Auto mode probes the remembered
     # device first, then high-confidence boards and finally generic USB serial
@@ -1579,12 +1590,19 @@ def detect_bridge(preferred_port=None, allow_unverified=False):
     serial_status_text = ""
 
     for candidate in flash_candidates:
+        cache_key = (candidate.port.upper(), (candidate.device_id or "").upper())
+        if (not manual and not allow_unverified and candidate is not configured
+                and candidate.confidence < 80 and cache_key in _NEGATIVE_PROBE_CACHE):
+            continue
         status_text = get_serial_status(candidate)
         if status_text and is_bridge_firmware(status_text):
+            _NEGATIVE_PROBE_CACHE.discard(cache_key)
             serial_port = candidate
             serial_status_text = status_text
             _remember_verified_port(candidate)
             break
+        if candidate.confidence < 80 and not _active_client_for_port(candidate.port):
+            _NEGATIVE_PROBE_CACHE.add(cache_key)
 
     unverified_candidate = False
     if serial_port is None and allow_unverified:

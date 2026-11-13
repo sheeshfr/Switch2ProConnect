@@ -1222,6 +1222,7 @@ async def run_discovery(quit_event, startup_bridge_context=None):
                 logger.info("Controller connection route: ESP32-S3 unavailable, switching to system bluetooth")
 
         host_mac_value = None
+        reconnect_mac = 0
         logger.info("Controller connection route: system bluetooth")
         
         from utils import get_local_mac_value, bluetooth_radio_present
@@ -1384,15 +1385,20 @@ async def run_discovery(quit_event, startup_bridge_context=None):
 
         _connecting_macs: set[str] = set()
 
-        async def add_controller(device: BLEDevice, paired: bool, advertised_product_id=None):
+        async def add_controller(device: BLEDevice, paired: bool, advertised_product_id=None, reconnect_mac=0):
             nonlocal pending_connections_count
             controller = None
             peers_at_start = set(connected_mac_addresses)
             stage = "task_created"
             sysbt_stage(device.address, stage, advertised_product_id, paired=paired)
             try:
+                is_known_cached = (
+                    paired
+                    or device.address.upper() in CONFIG.get_paired_controller_macs()
+                    or str(device.address).upper() in (getattr(CONFIG, "controller_fast_cache_entries", {}) or {})
+                )
                 controller = Controller(device, advertised_product_id=advertised_product_id,
-                                        paired_connection=paired)
+                                        paired_connection=is_known_cached)
                 if _SYSTEM_BT_DIAGNOSTICS:
                     controller._system_bt_diag_callback = (
                         lambda detail_stage, **detail: sysbt_stage(
@@ -1418,25 +1424,12 @@ async def run_discovery(quit_event, startup_bridge_context=None):
                 sysbt_stage(device.address, "initialize_succeeded", advertised_product_id,
                             product_id=getattr(getattr(controller, "controller_info", None), "product_id", None))
 
-                if not paired:
-                    # Pairing changes shared Windows bonding/radio state and
-                    # therefore remains serialized.
-                    stage = "pair_started"
-                    sysbt_stage(device.address, stage, advertised_product_id)
-                    async with CONNECTION_LOCK:
-                        await controller.pair()
-                    sysbt_stage(device.address, "pair_completed", advertised_product_id)
-                    logger.info(f"Paired successfully to {device.address}")
                 # BLE connection confirmed -- promote to connected so scanner won't retry
                 _connecting_macs.discard(device.address)
                 connected_mac_addresses.append(device.address)
-                try:
-                    reconnect_val = reconnect_mac if (reconnect_mac and reconnect_mac != 0) else host_mac_value
-                    CONFIG.add_paired_controller(device.address, reconnect_mac=reconnect_val, name=CONTROLER_NAMES.get(advertised_product_id, "Controller"))
-                except Exception as e:
-                    logger.debug(f"Failed to record paired controller: {e}")
             
-                # 4. Integrate the controller into VIRTUAL_CONTROLLERS under the global lock to prevent race conditions
+                # 4. Integrate the controller into VIRTUAL_CONTROLLERS immediately so the UI
+                # and virtual device come online at the exact moment the controller LED turns solid
                 async with GLOBAL_LOCK:
                     stage = "merge_started"
                     sysbt_stage(device.address, stage, advertised_product_id,
@@ -1459,15 +1452,8 @@ async def run_discovery(quit_event, startup_bridge_context=None):
                                 player=virtual_controller.player_number,
                                 members=len(virtual_controller.controllers))
                 
-                    # LED writes are non-critical and used to run twice here
-                    # (init_added_controller + update_all_player_leds), delaying
-                    # virtual-device readiness by over 100 ms on WinRT.
                     await virtual_controller.init_added_controller(controller, update_leds=False)
 
-                    # The first accepted WinRT input report arrives after the UI
-                    # has usually been created.  Queue a UI refresh when that
-                    # report supplies the first valid battery state, without
-                    # making the connection path wait for it.
                     def refresh_battery_ui(changed_controller, _state):
                         if (changed_controller is not controller
                                 or changed_controller not in virtual_controller.controllers):
@@ -1486,12 +1472,26 @@ async def run_discovery(quit_event, startup_bridge_context=None):
                 
                     pending_connections_count = max(0, pending_connections_count - 1)
                     logger.info(f"Controller {device.address} connected. Remaining pending connections: {pending_connections_count}")
-                # A controller must become usable as soon as its own input path is
-                # initialized.  Do not make it wait for another pending BLE attempt
-                # (which may still be in WinRT's 20-second connect timeout).
+
                 stage = "virtual_device_setup_started"
                 sysbt_stage(device.address, stage, advertised_product_id)
-                await asyncio.to_thread(virtual_controller.setup_virtual_device)
+                setup_vd_task = asyncio.create_task(asyncio.to_thread(virtual_controller.setup_virtual_device))
+
+                if not paired:
+                    stage = "pair_started"
+                    sysbt_stage(device.address, stage, advertised_product_id)
+                    async with CONNECTION_LOCK:
+                        await controller.pair(host_mac_value)
+                    sysbt_stage(device.address, "pair_completed", advertised_product_id)
+                    logger.info(f"Paired successfully to {device.address}")
+
+                try:
+                    reconnect_val = reconnect_mac if (reconnect_mac and reconnect_mac != 0) else host_mac_value
+                    CONFIG.add_paired_controller(device.address, reconnect_mac=reconnect_val, name=CONTROLER_NAMES.get(advertised_product_id, "Controller"))
+                except Exception as e:
+                    logger.debug(f"Failed to record paired controller: {e}")
+
+                await setup_vd_task
                 sysbt_stage(device.address, "virtual_device_ready", advertised_product_id)
                 async def _refresh_leds_after_virtual_ready():
                     try:
@@ -1587,7 +1587,7 @@ async def run_discovery(quit_event, startup_bridge_context=None):
                         _connecting_macs.add(device.address)
                         async with GLOBAL_LOCK:
                             pending_connections_count += 1
-                        asyncio.create_task(add_controller(device, False, product_id))
+                        asyncio.create_task(add_controller(device, False, product_id, reconnect_mac))
                     elif is_known_paired:
                         paired_to_another = (
                             stored_reconnect is not None
@@ -1613,7 +1613,7 @@ async def run_discovery(quit_event, startup_bridge_context=None):
                             _connecting_macs.add(device.address)
                             async with GLOBAL_LOCK:
                                 pending_connections_count += 1
-                            asyncio.create_task(add_controller(device, True, product_id))
+                            asyncio.create_task(add_controller(device, True, product_id, reconnect_mac))
                     elif host_mac_matches:
                         _sysbt_diag("device=%s side=%s decision=connect_paired reconnect=local",
                                     _sysbt_device_id(device.address), side)
@@ -1625,7 +1625,7 @@ async def run_discovery(quit_event, startup_bridge_context=None):
                         _connecting_macs.add(device.address)
                         async with GLOBAL_LOCK:
                             pending_connections_count += 1
-                        asyncio.create_task(add_controller(device, True, product_id))
+                        asyncio.create_task(add_controller(device, True, product_id, reconnect_mac))
                     else:
                         logger.info(f"Ignored device {device.address}: reconnect_mac={reconnect_mac} host_mac={host_mac_value} is_known_paired={is_known_paired} stored_reconnect={stored_reconnect}")
                         _sysbt_diag(

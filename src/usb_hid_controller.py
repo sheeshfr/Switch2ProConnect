@@ -347,6 +347,8 @@ def _winusb_device_paths(interface_guid: str, product_id: int = PRO_CONTROLLER2_
     import ctypes
     from ctypes import wintypes
 
+    if os.name != "nt":
+        return []
     setupapi = ctypes.WinDLL("setupapi", use_last_error=True)
     guid = _guid_from_string(interface_guid)
 
@@ -1738,6 +1740,8 @@ class _UsbHidClient:
                 "thread_priority", int(enabled), 0, 0, 0)
             return
         try:
+            if os.name != "nt":
+                return
             import ctypes
             from ctypes import wintypes
             kernel32 = ctypes.windll.kernel32

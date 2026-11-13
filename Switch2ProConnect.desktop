@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Switch 2 Pro Connect
+GenericName=Switch 2 Controller Utility
+Comment=Connect and configure Switch 2 Pro Controller on Linux
+Exec=bash -c "exec \\$(dirname %k)/Switch2ProConnect.sh"
+Icon=switch2proconnect
+Terminal=false
+Categories=Game;
+StartupNotify=true
+StartupWMClass=switch2proconnect

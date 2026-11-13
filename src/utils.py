@@ -17,14 +17,21 @@
 # Contact Information:
 # Electronic Mail: tommyw9318@gmail.com
 
-import win32api
-import winreg
 import sys
 import os
 import math
 import threading
 import ctypes
-from ctypes import wintypes
+
+if sys.platform == "win32":
+    import win32api
+    import winreg
+    from ctypes import wintypes
+else:
+    win32api = None
+    winreg = None
+    wintypes = getattr(ctypes, "wintypes", None)
+
 class USBIPAllocator:
     _lock = threading.Lock()
     _counter = 1
@@ -60,6 +67,9 @@ def get_usbip_dir() -> str:
 
 def get_usbip_exe_path() -> str:
     """Return the dynamically resolved path to usbip.exe."""
+    if sys.platform != "win32":
+        import shutil
+        return shutil.which("usbip") or "/usr/bin/usbip"
     usbip_dir = get_usbip_dir()
     primary = os.path.join(usbip_dir, "usbip.exe")
     if os.path.exists(primary):
@@ -95,20 +105,18 @@ GUID_BTHPORT_DEVICE_INTERFACE = "{0850302A-B344-4FDA-9BE9-90576B8D46F0}"
 
 
 def bluetooth_radio_present() -> bool:
-    """True when Windows currently has a Bluetooth radio device.
-
-    ``get_local_mac_value()`` below raises "No more data is available"
-    (ERROR_NO_MORE_ITEMS) both when there is no radio at all and when the Bluetooth stack
-    simply has not finished starting yet, which are very different situations: the first
-    should never be retried, the second always should. Asking PnP directly tells the two
-    apart, so a machine with no dongle stops retrying immediately while a machine whose
-    radio is still warming up at boot keeps its retries.
-
-    Returns True on any unexpected failure -- callers then fall back to their retry loop,
-    which is the safe direction to be wrong in.
-    """
+    """True when the system currently has a Bluetooth radio device."""
+    if sys.platform != "win32":
+        try:
+            sysfs_base = "/sys/class/bluetooth"
+            if os.path.isdir(sysfs_base):
+                return len(os.listdir(sysfs_base)) > 0
+        except Exception:
+            pass
+        return True
     if os.name != "nt":
         return True
+
     try:
         import ctypes
         from ctypes import wintypes
@@ -175,48 +183,64 @@ def get_local_mac_value():
     if _CACHED_LOCAL_MAC_VALUE is not None:
         return _CACHED_LOCAL_MAC_VALUE
 
-    try:
-        from ctypes import wintypes
-        class BLUETOOTH_FIND_RADIO_PARAMS(ctypes.Structure):
-            _fields_ = [('dwSize', wintypes.DWORD)]
-
-        class BLUETOOTH_ADDRESS(ctypes.Structure):
-            _fields_ = [('ullLong', ctypes.c_uint64)]
-
-        class BLUETOOTH_RADIO_INFO(ctypes.Structure):
-            _fields_ = [
-                ('dwSize', wintypes.DWORD),
-                ('address', BLUETOOTH_ADDRESS),
-                ('szName', wintypes.WCHAR * 248),
-                ('ulClassofDevice', wintypes.ULONG),
-                ('lmpSubversion', wintypes.USHORT),
-                ('manufacturer', wintypes.USHORT)
-            ]
-
+    if sys.platform == "win32":
         try:
-            bth = ctypes.WinDLL('BluetoothApis.dll')
-        except Exception:
-            bth = ctypes.WinDLL('bthprops.cpl')
+            from ctypes import wintypes
+            class BLUETOOTH_FIND_RADIO_PARAMS(ctypes.Structure):
+                _fields_ = [('dwSize', wintypes.DWORD)]
 
-        bth.BluetoothFindFirstRadio.argtypes = [ctypes.POINTER(BLUETOOTH_FIND_RADIO_PARAMS), ctypes.POINTER(wintypes.HANDLE)]
-        bth.BluetoothFindFirstRadio.restype = wintypes.HANDLE
-        bth.BluetoothGetRadioInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(BLUETOOTH_RADIO_INFO)]
-        bth.BluetoothGetRadioInfo.restype = wintypes.DWORD
-        bth.BluetoothFindRadioClose.argtypes = [wintypes.HANDLE]
-        bth.BluetoothFindRadioClose.restype = wintypes.BOOL
+            class BLUETOOTH_ADDRESS(ctypes.Structure):
+                _fields_ = [('ullLong', ctypes.c_uint64)]
 
-        params = BLUETOOTH_FIND_RADIO_PARAMS(dwSize=ctypes.sizeof(BLUETOOTH_FIND_RADIO_PARAMS))
-        radio = wintypes.HANDLE()
-        hfind = bth.BluetoothFindFirstRadio(ctypes.byref(params), ctypes.byref(radio))
-        if hfind:
+            class BLUETOOTH_RADIO_INFO(ctypes.Structure):
+                _fields_ = [
+                    ('dwSize', wintypes.DWORD),
+                    ('address', BLUETOOTH_ADDRESS),
+                    ('szName', wintypes.WCHAR * 248),
+                    ('ulClassofDevice', wintypes.ULONG),
+                    ('lmpSubversion', wintypes.USHORT),
+                    ('manufacturer', wintypes.USHORT)
+                ]
+
             try:
-                info = BLUETOOTH_RADIO_INFO(dwSize=ctypes.sizeof(BLUETOOTH_RADIO_INFO))
-                if bth.BluetoothGetRadioInfo(radio, ctypes.byref(info)) == 0:
-                    _CACHED_LOCAL_MAC_VALUE = info.address.ullLong
-                    return _CACHED_LOCAL_MAC_VALUE
-            finally:
-                ctypes.windll.kernel32.CloseHandle(radio)
-                bth.BluetoothFindRadioClose(hfind)
+                bth = ctypes.WinDLL('BluetoothApis.dll')
+            except Exception:
+                bth = ctypes.WinDLL('bthprops.cpl')
+
+            bth.BluetoothFindFirstRadio.argtypes = [ctypes.POINTER(BLUETOOTH_FIND_RADIO_PARAMS), ctypes.POINTER(wintypes.HANDLE)]
+            bth.BluetoothFindFirstRadio.restype = wintypes.HANDLE
+            bth.BluetoothGetRadioInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(BLUETOOTH_RADIO_INFO)]
+            bth.BluetoothGetRadioInfo.restype = wintypes.DWORD
+            bth.BluetoothFindRadioClose.argtypes = [wintypes.HANDLE]
+            bth.BluetoothFindRadioClose.restype = wintypes.BOOL
+
+            params = BLUETOOTH_FIND_RADIO_PARAMS(dwSize=ctypes.sizeof(BLUETOOTH_FIND_RADIO_PARAMS))
+            radio = wintypes.HANDLE()
+            hfind = bth.BluetoothFindFirstRadio(ctypes.byref(params), ctypes.byref(radio))
+            if hfind:
+                try:
+                    info = BLUETOOTH_RADIO_INFO(dwSize=ctypes.sizeof(BLUETOOTH_RADIO_INFO))
+                    if bth.BluetoothGetRadioInfo(radio, ctypes.byref(info)) == 0:
+                        _CACHED_LOCAL_MAC_VALUE = info.address.ullLong
+                        return _CACHED_LOCAL_MAC_VALUE
+                finally:
+                    ctypes.windll.kernel32.CloseHandle(radio)
+                    bth.BluetoothFindRadioClose(hfind)
+        except Exception:
+            pass
+
+    # Linux / cross-platform BlueZ & sysfs resolution
+    try:
+        sysfs_base = "/sys/class/bluetooth"
+        if os.path.isdir(sysfs_base):
+            for entry in sorted(os.listdir(sysfs_base)):
+                addr_path = os.path.join(sysfs_base, entry, "address")
+                if os.path.isfile(addr_path):
+                    with open(addr_path, "r") as f:
+                        mac_str = f.read().strip()
+                        if mac_str:
+                            _CACHED_LOCAL_MAC_VALUE = convert_mac_string_to_value(mac_str)
+                            return _CACHED_LOCAL_MAC_VALUE
     except Exception:
         pass
 
@@ -230,6 +254,7 @@ def get_local_mac_value():
         pass
 
     raise RuntimeError("No local Bluetooth adapter found or Bluetooth is disabled.")
+
 def get_stick_xy(data: bytes):
     """Convert 3 bytes containing stick x y values into these values"""
     value = decodeu(data)
@@ -255,10 +280,20 @@ def apply_radial_deadzone(x, y, deadzone):
     return x, y
 
 def press_or_release_mouse_button(state: bool, prev_state: bool, button: int, mouse_x: int, mouse_y):
-    if (state and not prev_state):
-        win32api.mouse_event(button, mouse_x, mouse_y, 0, 0)
-    if (not state and prev_state):
-        win32api.mouse_event(button << 1, mouse_x, mouse_y, 0, 0)
+    if win32api is not None:
+        if (state and not prev_state):
+            win32api.mouse_event(button, mouse_x, mouse_y, 0, 0)
+        if (not state and prev_state):
+            win32api.mouse_event(button << 1, mouse_x, mouse_y, 0, 0)
+    else:
+        try:
+            from linux_uinput import get_uinput_mouse
+            mouse = get_uinput_mouse()
+            if mouse is not None:
+                mouse.press_or_release(button, state, prev_state, mouse_x, mouse_y)
+        except Exception:
+            pass
+
 
 def reverse_bits(n: int, no_of_bits: int):
     result = 0
@@ -316,13 +351,9 @@ def _package_identity_result_has_identity(result):
     return int(result) == 122
 
 def is_packaged():
-    """Return True when running from inside an MSIX package (has package identity).
-
-    MSIX-packaged builds behave differently from the standalone GitHub .exe:
-    driver installation is delegated to external download+install, and startup
-    uses a StartupTask instead of the HKCU\\Run registry value (which is
-    virtualized and ineffective inside the package).
-    """
+    """Return True when running from inside an MSIX package (has package identity)."""
+    if sys.platform != "win32":
+        return False
     global _IS_PACKAGED_CACHE
     if _IS_PACKAGED_CACHE is not None:
         return _IS_PACKAGED_CACHE
@@ -331,9 +362,6 @@ def is_packaged():
         import ctypes
         from ctypes import wintypes
         length = ctypes.c_uint32(0)
-        # ERROR_INSUFFICIENT_BUFFER (122) means we have identity;
-        # APPMODEL_ERROR_NO_PACKAGE (15700), and every other error, do not prove
-        # that this process has package identity.
         rc = ctypes.windll.kernel32.GetCurrentPackageFullName(ctypes.byref(length), None)
         packaged = _package_identity_result_has_identity(rc)
     except Exception:
@@ -342,10 +370,7 @@ def is_packaged():
     return packaged
 
 def _set_startup_task(enabled: bool):
-    """Enable/disable startup for MSIX-packaged builds via the manifest StartupTask.
-
-    The TaskId must match the desktop:StartupTask Id declared in AppxManifest.xml.
-    """
+    """Enable/disable startup for MSIX-packaged builds via the manifest StartupTask."""
     try:
         from winrt.windows.applicationmodel import StartupTask, StartupTaskState
         task = StartupTask.get_async("Switch2ConnectStartup").get()
@@ -361,6 +386,36 @@ def _set_startup_task(enabled: bool):
         return False
 
 def set_startup(enabled: bool):
+    if sys.platform != "win32":
+        autostart_dir = os.path.expanduser("~/.config/autostart")
+        desktop_file = os.path.join(autostart_dir, "switch2proconnect.desktop")
+        if enabled:
+            os.makedirs(autostart_dir, exist_ok=True)
+            app_exec = sys.executable if getattr(sys, 'frozen', False) else f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}"'
+            content = f"""[Desktop Entry]
+Type=Application
+Name=Switch 2 Pro Connect
+Exec={app_exec}
+Hidden=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true
+"""
+            try:
+                with open(desktop_file, "w", encoding="utf-8") as f:
+                    f.write(content)
+                return True
+            except Exception as e:
+                print(f"Error creating desktop autostart entry: {e}")
+                return False
+        else:
+            try:
+                if os.path.exists(desktop_file):
+                    os.remove(desktop_file)
+                return True
+            except Exception as e:
+                print(f"Error removing desktop autostart entry: {e}")
+                return False
+
     if is_packaged():
         return _set_startup_task(enabled)
 
@@ -433,6 +488,8 @@ def cancel_joystick_calibration(virtual_controller):
         joystick_calibration_cancel_callback(virtual_controller)
 
 def disable_power_throttling():
+    if sys.platform != "win32":
+        return True
     try:
         import ctypes
         from ctypes import wintypes
@@ -453,6 +510,7 @@ def disable_power_throttling():
         SetProcessInformation = getattr(kernel32, 'SetProcessInformation', None)
         if not SetProcessInformation:
             return False
+
             
         state = PROCESS_POWER_THROTTLING_STATE()
         state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION

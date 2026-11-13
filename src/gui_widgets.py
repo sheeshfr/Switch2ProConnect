@@ -62,23 +62,24 @@ def normalize_app_path(path):
 def get_exe_display_name(path):
     if not path:
         return "Choose App"
-    try:
-        import win32api
-        info = win32api.GetFileVersionInfo(path, "\\")
-        lang, codepage = win32api.GetFileVersionInfo(path, "\\VarFileInfo\\Translation")[0]
-        for key in ("FileDescription", "ProductName"):
-            value = win32api.GetFileVersionInfo(path, f"\\StringFileInfo\\{lang:04x}{codepage:04x}\\{key}")
-            if value:
-                return str(value)
-    except Exception:
-        pass
+    if sys.platform == "win32":
+        try:
+            import win32api
+            info = win32api.GetFileVersionInfo(path, "\\")
+            lang, codepage = win32api.GetFileVersionInfo(path, "\\VarFileInfo\\Translation")[0]
+            for key in ("FileDescription", "ProductName"):
+                value = win32api.GetFileVersionInfo(path, f"\\StringFileInfo\\{lang:04x}{codepage:04x}\\{key}")
+                if value:
+                    return str(value)
+        except Exception:
+            pass
     return os.path.splitext(os.path.basename(path))[0] or "Choose App"
 
 _EXE_ICON_CACHE = {}
 _TASKBAR_ICON_CACHE = {}
 
 def _hicon_to_photoimage(hicon, size=(22, 22), should_destroy=False):
-    if not hicon:
+    if not hicon or sys.platform != "win32":
         return None
     try:
         from PIL import Image, ImageTk
@@ -180,7 +181,7 @@ def _hicon_to_photoimage(hicon, size=(22, 22), should_destroy=False):
         return None
 
 def get_file_icon(file_path, size=(18, 18)):
-    if not file_path or not os.path.exists(file_path):
+    if not file_path or not os.path.exists(file_path) or sys.platform != "win32":
         return None
     cache_key = (os.path.normpath(file_path).lower(), size)
     if cache_key in _EXE_ICON_CACHE:
@@ -220,6 +221,8 @@ def get_file_icon(file_path, size=(18, 18)):
         return None
 
 def get_window_taskbar_icon(hwnd=None, file_path=None, size=(22, 22)):
+    if sys.platform != "win32":
+        return None
     cache_key = (hwnd, os.path.normpath(file_path).lower() if file_path else "", size)
     if cache_key in _TASKBAR_ICON_CACHE:
         return _TASKBAR_ICON_CACHE[cache_key]
@@ -320,12 +323,12 @@ def apply_window_dark_theme_and_icon(window, bg_color=None):
         except Exception:
             pass
 
-    _apply_dwm()
-    try:
-        window.after(30, _apply_dwm)
-    except Exception:
-        pass
     if sys.platform == "win32":
+        _apply_dwm()
+        try:
+            window.after(30, _apply_dwm)
+        except Exception:
+            pass
         try:
             if isinstance(window, tk.Toplevel):
                 import gui as _gui_mod
